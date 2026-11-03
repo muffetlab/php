@@ -384,16 +384,16 @@ re-derive it.
   tests. That was arm64-only evidence on a host that cannot pull the other
   series' base image.
 - As of 2026-11-01 **all eight series have built and passed their tests in CI**,
-  on both architectures: run [41273388719][ci-run] ran the
-  sequential `build-and-verify` chain — 8 series × `cli`/`fpm` × `amd64`/`arm64`
-  = 32 legs, every one successful, each leg running `tests/smoke.sh` for its own
+  on both architectures: the sequential `build-and-verify` chain — 8 series ×
+  `cli`/`fpm` × `amd64`/`arm64` = 32 legs, every one successful, each leg
+  running `tests/smoke.sh` for its own
   variant, `tests/extensions.sh` and `tests/composer.sh` against the image it
   built, after the `validate` gate. That chain runs in test mode, so all the
   `merge` jobs were skipped and **nothing was published to a registry**: a green
   CI row is evidence the image builds and behaves, not evidence that a tag
   exists to pull.
-- Run [41288106152][publish-run] published the **7.4** series on 2026-11-01, as
-  two multi-arch manifest lists:
+- The **7.4** series was published on 2026-11-01, as two multi-arch manifest
+  lists:
 
   | Tag | Digest (both `7.4.33-*` and `7.4-*` resolve to it) |
   | --- | --- |
@@ -435,20 +435,31 @@ re-derive it.
 
 ### The remaining six series' releases (verified against the registry 2026-11-03)
 
-These run/digest facts were verified directly on the date in the heading — an
+These facts were verified directly on the date in the heading — an
 anonymous registry token, `GET /v2/muffetlab/php/tags/list` (28 tags, 5.6 the
 only one missing), and `GET /v2/muffetlab/php/manifests/<tag>` per variant
 above — not copied from run logs. Series-to-run mapping comes from each run's
 series-gated `merge` job names.
 
-| Series | Release run | Run date (UTC) | Note |
+**Run numbers predate a repository reset.** The release-run numbers and the CI
+chain that earned the `tested-in-CI` rows ran on the repository instance that
+existed before the reset; reconstructed from the public run list on 2026-11-04.
+If that instance is re-created, the numbers and the logs behind them stop
+resolving. What stays independently verifiable here is the registry side: every
+digest in this file can be re-read today from `ghcr.io/muffetlab/php` (an
+anonymous token plus `GET /v2/muffetlab/php/manifests/<tag>` returns the list
+digest in `Docker-Content-Digest`), and the `tested-in-CI` statuses are
+re-established empirically by dispatching `build-and-verify` against the
+re-created instance — when that run lands, add its date here.
+
+| Series | Release run (number) | Run date (UTC) | Note |
 | --- | --- | --- | --- |
-| 8.0 | [#41308384375][run-8_0] | 2026-11-01 | |
-| 8.1 | [#41308677246][run-8_1] | 2026-11-01 | |
-| 7.3 | [#41379484915][run-7_3] | 2026-11-02 | |
-| 7.2 | [#41381808799][run-7_2] | 2026-11-02 | its only failing job is `package-visibility`, as with 7.4 above; all four builds and both `merge` jobs passed, and the digests below were read from the registry |
-| 7.1 | [#41388688262][run-7_1] | 2026-11-02 | |
-| 7.0 | [#41396869463][run-7_0] | 2026-11-02 | |
+| 8.0 | 41308384375 | 2026-11-01 | |
+| 8.1 | 41308677246 | 2026-11-01 | |
+| 7.3 | 41379484915 | 2026-11-02 | |
+| 7.2 | 41381808799 | 2026-11-02 | its only failing job is `package-visibility`, as with 7.4 above; all four builds and both `merge` jobs passed, and the digests below were read from the registry |
+| 7.1 | 41388688262 | 2026-11-02 | |
+| 7.0 | 41396869463 | 2026-11-02 | |
 
 | Tag | Digest (both `<full>-*` and `<minor>-*` resolve to it) |
 | --- | --- |
@@ -478,14 +489,6 @@ own record (the registry date is the only thing this section vouches for).
   here and a fresh approval.
 
 [backports]: https://github.com/shivammathur/php-src-backports
-[ci-run]: https://github.com/muffetlab/php/actions/runs/41273388719
-[publish-run]: https://github.com/muffetlab/php/actions/runs/41288106152
-[run-7_0]: https://github.com/muffetlab/php/actions/runs/41396869463
-[run-7_1]: https://github.com/muffetlab/php/actions/runs/41388688262
-[run-7_2]: https://github.com/muffetlab/php/actions/runs/41381808799
-[run-7_3]: https://github.com/muffetlab/php/actions/runs/41379484915
-[run-8_0]: https://github.com/muffetlab/php/actions/runs/41308384375
-[run-8_1]: https://github.com/muffetlab/php/actions/runs/41308677246
 
 
 Status should be one of:
@@ -559,8 +562,8 @@ Keep one row per supported version and update it as reviews complete; CI fails
 if `SUPPORTED.md` drifts from this table plus the manifests.
 
 All eight rows are at `tested-in-CI`. The backports evidence above places the
-reviewed fixes inside each pinned commit, and on 2026-11-01 CI run
-[41273388719][ci-run] built all eight series — `cli` and
+reviewed fixes inside each pinned commit, and on 2026-11-01 the CI chain built
+all eight series — `cli` and
 `fpm`, `amd64` and `arm64`, 32 legs — with `tests/smoke.sh` for each variant,
 `tests/extensions.sh` and `tests/composer.sh` passing on the image every leg
 built. That is precisely the condition this file set for the value: a real build
