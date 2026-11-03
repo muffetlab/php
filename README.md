@@ -65,12 +65,12 @@ Recommended: deploy the minor tag, `X.Y-<variant>`. It cannot change major
 version, and a rebuild of its series republishes it, so the next security
 patch reaches every pull without a release cut on your side. The exact
 `X.Y.Z-<variant>` tag exists for when a deploy log must name the PHP version;
-the digest is the only name that binds to an exact manifest. One tag per PHP
-version exists, so a rebuild of `v8.1.34` republishes the
-*same* `8.1.34-fpm` tags instead of minting a new one — and a release run rebuilds
-only the series its tag
-names, so `v5.6.40` does not refresh `8.1.34-cli`; each series moves when its own
-tag is pushed. Tags do not name the OpenSSL route, because the
+the digest is the only name that binds to an exact manifest.
+One tag per PHP version exists, so a rebuild of `v8.1.34` republishes the
+same `8.1.34-fpm` tags instead of minting a new one — and a release run
+rebuilds only the series its tag names, so `v5.6.40` does not refresh
+`8.1.34-cli`; each series moves when its own tag is pushed. Tags do not name
+the OpenSSL route, because the
 pipeline fixes one route per series (see below); to know what you are actually
 running, read it out of the image:
 
@@ -211,6 +211,75 @@ So `docker-php-ext-enable intl.so` works everywhere, whereas the bare form that
 command versus documentation rule) is an open maintainer decision; see
 [MAINTAINING.md](MAINTAINING.md#dockerfile-caveats-read-before-trusting-a-build)
 caveat 3.
+
+## Configuring PHP and FPM
+
+The image ships a complete configuration surface at fixed paths, and there are
+exactly three supported ways to change PHP settings. Every fact below was
+verified against the published `8.1-fpm` image (2026-11-03); where a variant
+differs, it says so.
+
+**PHP INI.** `PHP_INI_DIR` is `/opt/php/etc` in both variants. The build copies
+PHP's own `php.ini-production` verbatim to `/opt/php/etc/php.ini` and never
+edits it afterwards; its `conf.d` subdirectory is the compiled-in scan dir, and
+the vendored `docker-php-ext-enable` writes each enabled extension as
+`/opt/php/etc/conf.d/docker-php-ext-<name>.ini` there. Order matters and is
+overridable, not magic: files in `conf.d` are parsed after the main `php.ini`,
+so a mounted fragment wins:
+
+```sh
+# an extra ini read after php.ini; later files inside the dir also win
+docker run --rm -v ./zz-override.ini:/opt/php/etc/conf.d/zz-override.ini:ro \
+  ghcr.io/muffetlab/php:8.1-fpm php -r 'echo ini_get("memory_limit");'
+```
+
+Two more ways to set PHP options, each with a use it genuinely fits:
+
+- `PHP_INI_SCAN_DIR`, as an environment variable, **replaces** the scanned
+  directory list. To add a directory without losing the default one (extension
+  fragments included), keep an empty entry for the compiled-in dir:
+  `PHP_INI_SCAN_DIR=:/opt/my/extra` (verified: a setting from the extra dir
+  takes effect and the shipped fragments still load).
+- `php -d ...` one-offs (CLI variant, or `docker exec` into the FPM container
+  for a quick probe). Nothing persistent, no mount.
+
+`php --ini` in either variant prints the effective main file, scan dir and
+parsed files — the cheap way to prove which set a container really uses.
+
+**FPM (`fpm` variant only; the CLI image has no FPM binary).** The build leaves
+`php-fpm.conf.default` in place alongside the live files, so the shipped state
+is diffable inside the image itself:
+
+| File | Shipped state |
+| --- | --- |
+| `/opt/php/etc/php-fpm.conf` | copied from the upstream default, `daemonize = no`, `include=/opt/php/etc/php-fpm.d/*.conf` |
+| `/opt/php/etc/php-fpm.d/www.conf` | copied from `www.conf.default` (7.x–8.x); `user`/`group = php-fpm`, `listen = 9000`, `clear_env = yes` |
+
+`daemonize = no` matches what the image's own entrypoint does — the CMD is
+`exec /opt/php/sbin/php-fpm -F` — so the container's life is the FPM master's
+life, as a good PID-1 should be.
+
+Ways to change the pool, verified by `php-fpm -t` picking up an added file:
+
+- Add a pool or pool override as its own file in
+  `/opt/php/etc/php-fpm.d/` (mount one as `-v ./my-pool.conf:/opt/php/etc/php-fpm.d/10-my.conf:ro`);
+  the `include` glob reads every `*.conf` there. A later file's setting wins
+  the key it touches, so a small override file beats editing `www.conf` in a
+  derived image.
+- Replace `www.conf` wholesale. Keep its `.default` sibling in view (7.x–8.x)
+  while you do; PHP 5.6 has no `www.conf.default` — the build generates its
+  pool file against no upstream template (seen in the Dockerfile's
+  `version-branch: fpm-www-conf-fallback` note) — so copy the current file out
+  first if you override there.
+- Validate without starting: `/opt/php/sbin/php-fpm -t` parses the full config
+  including every included file.
+
+`clear_env = yes` is deliberate and load-bearing: FPM does not pass the
+container's environment to workers, so application configuration travels via
+FastCGI params (as `docker-compose.example.yml`'s Nginx does), via the pool
+file's `env[NAME] = value`, or by flipping this directive — in that order of
+preference. See [Runtime network model](#runtime-network-model) for why an
+FPM address should stay off the internet.
 
 ## Per-version extension notes
 
