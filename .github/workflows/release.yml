@@ -1,0 +1,780 @@
+name: release
+
+# Publishes reviewed images to the registry (GHCR by default, optional
+# Docker Hub mirror when DOCKERHUB_USERNAME/DOCKERHUB_TOKEN secrets exist).
+#
+# Published image: ghcr.io/muffetlab/php (registry + namespace inputs, image
+# name "php"). The namespace is the GHCR owner, so a fork overrides it with its
+# own GitHub user/org.
+#
+# Triggers:
+#   - push of a release tag:  vX.Y.Z  (one tag per PHP version; the guard job
+#     below is what enforces the shape)
+#     The tag names the PHP version, and exactly one tag exists per version:
+#     rebuilding it (new base digest, newer backports commit) moves the same
+#     tag to the new commit and republishes the same image tags rather than
+#     inventing v8.1.34-2. The tag's series is also what gets built: v5.6.40
+#     rebuilds 5.6's variants only.
+#   - workflow_dispatch from the default branch (main or master), publishing the
+#     series named by the required version input. It writes the same names a tag
+#     run writes: <minor>-<variant> plus the <full>-<variant> tag read from the
+#     image it built. Neither path writes a latest tag -- see below.
+#
+# Safety model:
+#   - No :latest-<variant>, and no plain :latest either. Because one run
+#     publishes one series, "latest" would resolve to whichever series was
+#     released last -- not the newest PHP, not a recommendation, and it could
+#     move 8.1 -> 7.4 on an unrelated rebuild. <minor>-<variant> is the only
+#     floating name, and it cannot change the major version.
+#   - Re-runs the same static validate gate as CI (manifest policy + patch
+#     SHA-256 vs review records).
+#   - The selected version's manifest must itself be release-ready: validate
+#     refuses a run whose series is unfilled or not PATCHSET_APPROVED=1 rather
+#     than finishing green with nothing published. build-version.yml still skips
+#     any manifest that is unfilled or unapproved, so a release only publishes
+#     what humans have reviewed; it never lowers a gate.
+#   - build-version.yml builds and tests each variant natively on linux/amd64
+#     and linux/arm64, pushes the per-arch images by digest, and merges them into
+#     one multi-arch manifest list per tag, so every published name resolves on
+#     both architectures.
+#   - build-version.yml independently refuses push unless github.ref is a
+#     branch it accepts (main or master) or a tag whose name starts with a
+#     version, and only release.yml's guard job lets a correctly shaped
+#     vX.Y.Z tag reach the build jobs at all.
+#   - One run publishes one series -- the series the tag names, or the series
+#     the version input names. The other series stay on their previous build,
+#     including their base digest, until each is tagged in turn. The old
+#     5.6 -> 7.x -> 8.x chain is gone here because a run can no longer select
+#     more than one build job; build-and-verify.yml keeps the chain, since a PR
+#     still has to test all eight.
+
+on:
+  push:
+    tags:
+      # Bare "v*" is what a release tag looks like now (v8.1.34); the shape and
+      # the version series are enforced in the guard job below, because a glob
+      # cannot express either and this workflow pushes images.
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "PHP series to release (one series per run; validated against the supported list)"
+        type: string
+        required: true
+        default: "8.1"
+      namespace:
+        description: "GHCR owner/namespace that hosts the php image (default: muffetlab)"
+        type: string
+        default: "muffetlab"
+      attestations:
+        # The `inputs` context is empty for a tag push, so a bare
+        # `${{ inputs.attestations }}` would hand the callee an empty value for a
+        # boolean input on exactly the run type that publishes images. Each
+        # release job therefore passes
+        # `github.event_name == 'push' || inputs.attestations`: a tag run always
+        # attests, a dispatch run honours the checkbox (including opting out).
+        description: "Attach provenance/SBOM attestations"
+        type: boolean
+        default: true
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  SUPPORTED_VERSIONS: "5.6 7.0 7.1 7.2 7.3 7.4 8.0 8.1"
+
+jobs:
+  guard:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      # The one PHP series this run publishes: the series a vX.Y.Z tag names, or
+      # the series the dispatch input names. Every release-* job gates on it, so
+      # a tag rebuilds that version's variants and architectures only.
+      series: ${{ steps.tag.outputs.series || steps.dispatch.outputs.series }}
+    steps:
+      - name: Dispatch allowed only from the default branch
+        if: github.event_name == 'workflow_dispatch' && !(github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+        run: |
+          echo "::error::manual release is only allowed from main or master"
+          exit 1
+      # A free string rather than a `choice` input: a choice list would repeat the
+      # supported series here and drift from SUPPORTED_VERSIONS (the same list
+      # build.sh and manifests/*.env agree with). A typo costs a five-second guard
+      # failure, which is the point of checking it before validate.
+      - name: Manual dispatch version check
+        if: github.event_name == 'workflow_dispatch'
+        id: dispatch
+        env:
+          VERSION_INPUT: ${{ inputs.version }}
+        run: |
+          set -eu
+          series="$VERSION_INPUT"
+          if ! printf '%s' "$series" | grep -Eq '^[0-9]+\.[0-9]+$'; then
+            echo "::error::version '$series' is not a PHP series (expected <major>.<minor>, e.g. 5.6)"
+            exit 1
+          fi
+          case " $SUPPORTED_VERSIONS " in
+            *" $series "*) ;;
+            *)
+              echo "::error::version '$series' names PHP series '$series', which is not supported (supported: $SUPPORTED_VERSIONS)"
+              exit 1 ;;
+          esac
+          echo "Manual release of PHP series $series"
+          echo "series=$series" >> "$GITHUB_OUTPUT"
+      - name: Release tag check
+        if: github.event_name == 'push'
+        id: tag
+        run: |
+          set -eu
+          tag="${GITHUB_REF#refs/tags/}"
+          # The trigger glob is "v*", so anything starting with v reaches this
+          # job -- v1-bump-notes, void-tools, a stray v8.1 from a shell history.
+          # Only a PHP version release may run a publish, so require the shape
+          # here, before validate or any build job starts: exactly vX.Y.Z, one
+          # tag per PHP version. A rebuild of that version does not add a tag --
+          # it moves v8.1.34 to the new commit, and the same <full>-<variant>
+          # tags are republished over the old ones. The OpenSSL route is
+          # deliberately not part of a tag name: the validate job below fixes one
+          # route per series, so the suffix could never express a choice. The
+          # cost of that is that a future route migration would republish the
+          # same name over a different libssl build -- so deployments pin by
+          # digest, and the route is read out of /opt/php/BUILD-PROVENANCE rather
+          # than guessed from a tag.
+          # Suffixes (v8.1.34-2, v8.1.34-rc1) are rejected so the tag namespace
+          # stays one-version-one-tag and cannot drift into parallel history.
+          if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::tag '$tag' is not a release tag (expected exactly vX.Y.Z; a rebuild moves the existing tag instead of adding a suffix); no images will be pushed"
+            exit 1
+          fi
+          # And require the series it names to be a version this kit supports,
+          # so a typo (v8.11.34) cannot start a release run at all.
+          series="$(printf '%s' "${tag#v}" | cut -d. -f1,2)"
+          case " $SUPPORTED_VERSIONS " in
+            *" $series "*) ;;
+            *)
+              echo "::error::tag '$tag' names PHP series '$series', which is not supported (supported: $SUPPORTED_VERSIONS)"
+              exit 1 ;;
+          esac
+          echo "Releasing $tag (PHP series $series)"
+          echo "series=$series" >> "$GITHUB_OUTPUT"
+
+  validate:
+    needs: guard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install shellcheck and jq
+        run: sudo apt-get update && sudo apt-get install -y shellcheck jq
+
+      - name: Shellcheck scripts
+        run: |
+          # Glob, do not enumerate: a new script must be linted without anyone
+          # remembering to add it to a list in three workflows.
+          mapfile -t files < <(find . -name '*.sh' -not -path './.git/*' | sort)
+          printf 'shellcheck: %s\n' "${files[@]}"
+          shellcheck -x "${files[@]}"
+
+      - name: Bash syntax check
+        run: |
+          mapfile -t files < <(find . -name '*.sh' -not -path './.git/*' | sort)
+          bash -n "${files[@]}"
+
+      - name: Dockerfile RUN shell syntax
+        run: ./tools/lint-dockerfile-shells.sh
+
+      - name: Verify-script harness
+        run: |
+          ./tests/verify-harness.sh
+
+      # Same reason as in build-and-verify.yml, and more important here: this is the
+      # gate in front of a push. A run whose OS gate never scanned must not be able to
+      # reach the registry looking like a clean one.
+      - name: OS gate verdict harness
+        run: |
+          ./tests/scan-image-harness.sh
+
+      - name: Version-branch inventory in sync
+        run: |
+          ./tools/list-version-branches.sh
+          ./tools/list-version-branches.sh --check
+
+      # Same gate as build-and-verify.yml: this is the workflow that publishes,
+      # so the extension baseline copies are re-checked here rather than relying
+      # on the PR run having happened.
+      - name: Extension baseline copies in sync
+        run: ./tools/check-ext-baseline.sh --check
+
+      # Same reasoning as build-and-verify.yml, and the same reason this workflow
+      # needs it at all: the merge job publishes an Overview as part of a release,
+      # and a release cannot be un-published cleanly. Checking the payload builder
+      # here means the release that writes the text has already run the assertions
+      # about that text, on the same runner image.
+      - name: Docker Hub README sync self-test
+        run: ./tools/sync-dockerhub-readme.sh --self-test
+
+      - name: Manifest policy check
+        run: |
+          set -eu
+          fail=0
+          err() { echo "::error::$*"; fail=1; }
+          for v in $SUPPORTED_VERSIONS; do
+            [ -f "manifests/$v.env" ] || err "missing manifests/$v.env"
+          done
+          for f in manifests/*.env; do
+            ver="$(basename "$f" .env)"
+            case " $SUPPORTED_VERSIONS " in
+              *" $ver "*) ;;
+              *) err "$f: version not in supported list"; continue ;;
+            esac
+            # Trusted project config, not untrusted input.
+            # shellcheck source=/dev/null
+            . "./$f"
+            case "${OPENSSL_ROUTE:-}" in openssl11|openssl3) ;; *) err "$f: bad OPENSSL_ROUTE" ;; esac
+            if [ "$ver" = "5.6" ] && [ "${OPENSSL_ROUTE:-}" != "openssl11" ]; then
+              err "$f: 5.6 requires openssl11"
+            fi
+            if [ "$ver" != "5.6" ] && [ "${OPENSSL_ROUTE:-}" != "openssl3" ]; then
+              err "$f: $ver requires openssl3"
+            fi
+            # Source of record for every series is the backports fork: the
+            # official php/php-src tree ships no security fixes for an EOL line.
+            # Moving a manifest to official php-src is a reviewed change to this
+            # policy, to build.sh and to the Dockerfile guard -- not a manifest edit.
+            case "${PHP_SRC_REPO:-}" in
+              *php-src-backports*) ;;
+              "") err "$f: PHP_SRC_REPO unset" ;;
+              *) err "$f: PHP_SRC_REPO must be shivammathur/php-src-backports (got '${PHP_SRC_REPO:-}')" ;;
+            esac
+            if ! printf '%s' "${PHP_SRC_COMMIT:-}" | grep -Eq '^[0-9a-f]{40}$'; then
+              err "$f: PHP_SRC_COMMIT must be a full 40-character commit SHA"
+            fi
+            # "@sha256:" alone is not a pin: an unfilled manifest ships
+            # "@sha256:REPLACE_WITH_DIGEST". Require 64 hex, but report it as an
+            # unready manifest (build jobs skip it) rather than a validate failure.
+            case "${BASE_IMAGE:-}" in
+              *@sha256:*)
+                digest="${BASE_IMAGE##*@sha256:}"
+                if ! printf '%s' "$digest" | grep -Eq '^[0-9a-f]{64}$'; then
+                  case "$digest" in
+                    REPLACE_WITH*)
+                      echo "::warning::$f: BASE_IMAGE digest is still a placeholder; run tools/resolve-base-digest.sh in CI and fill it before this version builds" ;;
+                    *)
+                      echo "::warning::$f: BASE_IMAGE digest '${digest}' is not 64 lowercase hex -- this manifest is not buildable yet (run tools/resolve-base-digest.sh in CI)" ;;
+                  esac
+                fi
+                ;;
+              "") err "$f: BASE_IMAGE unset" ;;
+              *) err "$f: BASE_IMAGE must be pinned by digest (repo@sha256:<64 hex>)" ;;
+            esac
+            variants="${BUILD_VARIANTS:-}"
+            [ -n "$variants" ] || err "$f: BUILD_VARIANTS empty"
+            for vv in $variants; do
+              case "$vv" in cli|fpm) ;; *) err "$f: bad BUILD_VARIANTS entry '$vv'" ;; esac
+            done
+            case "${PATCHSET_APPROVED:-}" in 0|1) ;; *) err "$f: PATCHSET_APPROVED must be 0 or 1" ;; esac
+            # apt lists are interpolated unquoted into apt-get inside the image
+            # build, so they must be plain Debian package specifications
+            # (name[:arch][=version]) -- same rule build.sh enforces.
+            pkg_re='^[A-Za-z0-9][A-Za-z0-9.+-]*(:[A-Za-z0-9.+-]+)?(=[A-Za-z0-9.+:~-]+)?$'
+            for plist in BUILD_PACKAGES RUNTIME_PACKAGES; do
+              eval "plistval=\${$plist:-}"
+              # shellcheck disable=SC2086
+              for tok in $plistval; do
+                printf '%s' "$tok" | grep -Eq "$pkg_re" \
+                  || err "$f: $plist contains an invalid package specification '$tok'"
+              done
+            done
+            # 1 = ship the configured source tree (official-image parity),
+            # 0 = omit it to keep the image small. Only those two are valid.
+            case "${SHIP_PHP_SOURCE:-1}" in 0|1) ;; *) err "$f: SHIP_PHP_SOURCE must be 0 or 1" ;; esac
+            # PHP_EXTENSIONS / PECL_EXTENSIONS add to the kit baseline and are
+            # interpolated unquoted into build-stage shell, so they get the same
+            # kind of shape check as the apt lists (an extension name is
+            # [a-z0-9_]). Which names a series can build at all is the
+            # Dockerfile's availability table -- deliberately not duplicated here.
+            ext_re='^[a-z0-9_]+$'
+            for elist in PHP_EXTENSIONS PECL_EXTENSIONS; do
+              eval "elistval=\${$elist:-}"
+              # shellcheck disable=SC2086
+              for tok in $elistval; do
+                printf '%s' "$tok" | grep -Eq "$ext_re" \
+                  || err "$f: $elist contains an invalid extension name '$tok'"
+              done
+            done
+            # Optional Composer overrides must respect the series policy.
+            cv="${COMPOSER_VERSION:-}"
+            cs="${COMPOSER_SHA256:-}"
+            case "$ver" in 5.6|7.0|7.1) policy_cv="1.10.28" ;; *) policy_cv="2.11.0" ;; esac
+            if [ -n "$cv" ]; then
+              if ! printf '%s' "$cv" | grep -Eq '^(1\.10|2)(\.[0-9]+)+$'; then
+                err "$f: COMPOSER_VERSION must be an exact 1.10.x or 2.x release (got '$cv')"
+              fi
+              case "$ver:$cv" in
+                5.6:2.*|7.0:2.*|7.1:2.*)
+                  err "$f: PHP $ver cannot run Composer 2.x (requires PHP >= 7.2.5)" ;;
+              esac
+              if [ -z "$cs" ] && [ "$cv" != "$policy_cv" ]; then
+                echo "::warning::$f: COMPOSER_VERSION=$cv overrides the policy pin without COMPOSER_SHA256"
+              fi
+            fi
+            if [ -n "$cs" ] && ! printf '%s' "$cs" | grep -Eq '^[0-9a-f]{64}$'; then
+              err "$f: COMPOSER_SHA256 must be 64 lowercase hex chars"
+            fi
+          done
+          [ "$fail" = 0 ]
+
+      - name: Composer pins in sync
+        run: |
+          set -eu
+          fail=0
+          err() { echo "::error::$*"; fail=1; }
+          legacy_pin="$(sed -n 's/.*policy_ver="\(1\.10\.[0-9]*\)".*/\1/p' Dockerfile | head -1)"
+          modern_pin="$(sed -n 's/.*policy_ver="\(2\.[0-9.]*\)".*/\1/p' Dockerfile | head -1)"
+          [ -n "$legacy_pin" ] || err "Dockerfile: legacy Composer pin not found"
+          [ -n "$modern_pin" ] || err "Dockerfile: modern Composer pin not found"
+          for f in build.sh .github/workflows/build-version.yml tools/gen-supported.sh README.md MAINTAINING.md SUPPORTED.md; do
+            grep -Fq "$legacy_pin" "$f" || err "$f: missing Composer pin $legacy_pin"
+            grep -Fq "$modern_pin" "$f" || err "$f: missing Composer pin $modern_pin"
+          done
+          [ "$fail" = 0 ]
+
+      - name: Published image address in sync
+        run: ./tools/check-image-name.sh
+
+      - name: Vendored docker-php-ext hash check
+        run: |
+          set -eu
+          (cd docker-php-ext && shasum -a 256 -c SHA256SUMS)
+          dockerfile_sha="$(sed -n 's/^ENV DOCKER_PHP_EXT_SRC_COMMIT=\([0-9a-f]\{40\}\)$/\1/p' Dockerfile)"
+          [ -n "$dockerfile_sha" ] || { echo "::error::DOCKER_PHP_EXT_SRC_COMMIT pin not found in Dockerfile"; exit 1; }
+          grep -q "$dockerfile_sha" docker-php-ext/README.md || {
+            echo "::error::Dockerfile pin $dockerfile_sha not recorded in docker-php-ext/README.md"; exit 1; }
+
+      - name: Patch review record check
+        run: |
+          set -eu
+          fail=0
+          err() { echo "::error::$*"; fail=1; }
+          for dir in patches/*/; do
+            [ -d "$dir" ] || continue
+            ver="$(basename "$dir")"
+            case " $SUPPORTED_VERSIONS " in
+              *" $ver "*) ;;
+              *) err "$dir: unsupported version directory"; continue ;;
+            esac
+            for p in "$dir"*.patch; do
+              [ -e "$p" ] || continue
+              rec=""
+              for r in "$dir"REVIEW-*.md; do
+                [ -e "$r" ] || continue
+                if grep -Fqi "$(basename "$p")" "$r"; then rec="$r"; break; fi
+              done
+              if [ -z "$rec" ]; then
+                err "$p: no review record (REVIEW-*.md referencing this file)"
+                continue
+              fi
+              hash="$(sha256sum "$p" | awk '{print $1}')"
+              if ! grep -Fq "$hash" "$rec"; then
+                err "$p: SHA-256 $hash not recorded in $rec"
+              fi
+            done
+          done
+          [ "$fail" = 0 ]
+
+      - name: SUPPORTED.md up to date
+        run: |
+          ./tools/gen-supported.sh
+          if ! git diff --quiet -- SUPPORTED.md; then
+            echo "::error::SUPPORTED.md is stale; run tools/gen-supported.sh and commit"
+            git diff -- SUPPORTED.md
+            exit 1
+          fi
+
+      # The series this run publishes, not "any of them": a tag names one series,
+      # and an unreviewed or unfilled manifest for that series has to fail the run
+      # instead of going green with no image published. The same fields
+      # build-version.yml checks before it will start a build.
+      - name: Selected series is release-ready
+        env:
+          SERIES: ${{ needs.guard.outputs.series }}
+        run: |
+          set -eu
+          [ -n "$SERIES" ] || { echo "::error::guard selected no PHP series"; exit 1; }
+          printf '%s' "$SERIES" | grep -Eq '^[0-9]+\.[0-9]+$' || {
+            echo "::error::guard produced an invalid series '$SERIES'"; exit 1; }
+          [ -f "manifests/$SERIES.env" ] || {
+            echo "::error::manifests/$SERIES.env is missing"; exit 1; }
+          # shellcheck source=/dev/null
+          . "manifests/$SERIES.env"
+          unready=""
+          for var in BASE_IMAGE SOURCE_REF PHP_SRC_COMMIT; do
+            eval "val=\${$var:-}"
+            case "$val" in ""|*REPLACE_WITH*) unready="${unready} ${var}" ;; esac
+          done
+          # "@sha256:" alone is not a pin: the placeholder text has to be 64 hex.
+          case "${BASE_IMAGE:-}" in
+            *@sha256:*)
+              printf '%s' "${BASE_IMAGE##*@sha256:}" | grep -Eq '^[0-9a-f]{64}$' \
+                || unready="${unready} BASE_IMAGE-digest" ;;
+            *) unready="${unready} BASE_IMAGE-pin" ;;
+          esac
+          [ "${PATCHSET_APPROVED:-0}" = "1" ] || unready="${unready} PATCHSET_APPROVED"
+          if [ -n "$unready" ]; then
+            echo "::error::PHP series $SERIES is not release-ready (unset or placeholder:${unready}); refusing to run an empty release"
+            exit 1
+          fi
+          echo "PHP series $SERIES is release-ready; publishing its declared variants ($(sed -n 's/^BUILD_VARIANTS="\(.*\)"/\1/p' "manifests/$SERIES.env"))"
+
+  # --- One series per run ---------------------------------------------------
+  # Each job gates on guard's selected series, so exactly one of these builds:
+  # the version the tag names (or the dispatch input names). They all need guard
+  # as well as validate because a job can only read outputs from its own needs.
+  # Within the selected job, build-version.yml still covers cli + fpm on amd64
+  # and arm64, so "one series" is not "one image".
+  # No caller here passes base_image_override: a release builds on the manifest's
+  # reviewed BASE_IMAGE and nothing else, and build-version.yml fails the run if
+  # push=true ever arrives together with an override, so a trial cannot publish
+  # even through a future caller that forgot the rule.
+  release-5_6:
+    needs: [validate, guard]
+    if: needs.guard.outputs.series == '5.6'
+    uses: ./.github/workflows/build-version.yml
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    with:
+      version: "5.6"
+      push: true
+      namespace: ${{ inputs.namespace || 'muffetlab' }}
+      attestations: ${{ github.event_name == 'push' || inputs.attestations }}
+    secrets:
+      token: ${{ secrets.GITHUB_TOKEN }}
+      dockerhub_username: ${{ secrets.DOCKERHUB_USERNAME }}
+      dockerhub_token: ${{ secrets.DOCKERHUB_TOKEN }}
+
+  release-7_0:
+    needs: [validate, guard]
+    if: needs.guard.outputs.series == '7.0'
+    uses: ./.github/workflows/build-version.yml
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    with:
+      version: "7.0"
+      push: true
+      namespace: ${{ inputs.namespace || 'muffetlab' }}
+      attestations: ${{ github.event_name == 'push' || inputs.attestations }}
+    secrets:
+      token: ${{ secrets.GITHUB_TOKEN }}
+      dockerhub_username: ${{ secrets.DOCKERHUB_USERNAME }}
+      dockerhub_token: ${{ secrets.DOCKERHUB_TOKEN }}
+
+  release-7_1:
+    needs: [validate, guard]
+    if: needs.guard.outputs.series == '7.1'
+    uses: ./.github/workflows/build-version.yml
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    with:
+      version: "7.1"
+      push: true
+      namespace: ${{ inputs.namespace || 'muffetlab' }}
+      attestations: ${{ github.event_name == 'push' || inputs.attestations }}
+    secrets:
+      token: ${{ secrets.GITHUB_TOKEN }}
+      dockerhub_username: ${{ secrets.DOCKERHUB_USERNAME }}
+      dockerhub_token: ${{ secrets.DOCKERHUB_TOKEN }}
+
+  release-7_2:
+    needs: [validate, guard]
+    if: needs.guard.outputs.series == '7.2'
+    uses: ./.github/workflows/build-version.yml
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    with:
+      version: "7.2"
+      push: true
+      namespace: ${{ inputs.namespace || 'muffetlab' }}
+      attestations: ${{ github.event_name == 'push' || inputs.attestations }}
+    secrets:
+      token: ${{ secrets.GITHUB_TOKEN }}
+      dockerhub_username: ${{ secrets.DOCKERHUB_USERNAME }}
+      dockerhub_token: ${{ secrets.DOCKERHUB_TOKEN }}
+
+  release-7_3:
+    needs: [validate, guard]
+    if: needs.guard.outputs.series == '7.3'
+    uses: ./.github/workflows/build-version.yml
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    with:
+      version: "7.3"
+      push: true
+      namespace: ${{ inputs.namespace || 'muffetlab' }}
+      attestations: ${{ github.event_name == 'push' || inputs.attestations }}
+    secrets:
+      token: ${{ secrets.GITHUB_TOKEN }}
+      dockerhub_username: ${{ secrets.DOCKERHUB_USERNAME }}
+      dockerhub_token: ${{ secrets.DOCKERHUB_TOKEN }}
+
+  release-7_4:
+    needs: [validate, guard]
+    if: needs.guard.outputs.series == '7.4'
+    uses: ./.github/workflows/build-version.yml
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    with:
+      version: "7.4"
+      push: true
+      namespace: ${{ inputs.namespace || 'muffetlab' }}
+      attestations: ${{ github.event_name == 'push' || inputs.attestations }}
+    secrets:
+      token: ${{ secrets.GITHUB_TOKEN }}
+      dockerhub_username: ${{ secrets.DOCKERHUB_USERNAME }}
+      dockerhub_token: ${{ secrets.DOCKERHUB_TOKEN }}
+
+  release-8_0:
+    needs: [validate, guard]
+    if: needs.guard.outputs.series == '8.0'
+    uses: ./.github/workflows/build-version.yml
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    with:
+      version: "8.0"
+      push: true
+      namespace: ${{ inputs.namespace || 'muffetlab' }}
+      attestations: ${{ github.event_name == 'push' || inputs.attestations }}
+    secrets:
+      token: ${{ secrets.GITHUB_TOKEN }}
+      dockerhub_username: ${{ secrets.DOCKERHUB_USERNAME }}
+      dockerhub_token: ${{ secrets.DOCKERHUB_TOKEN }}
+
+  release-8_1:
+    needs: [validate, guard]
+    if: needs.guard.outputs.series == '8.1'
+    uses: ./.github/workflows/build-version.yml
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    with:
+      version: "8.1"
+      push: true
+      namespace: ${{ inputs.namespace || 'muffetlab' }}
+      attestations: ${{ github.event_name == 'push' || inputs.attestations }}
+    secrets:
+      token: ${{ secrets.GITHUB_TOKEN }}
+      dockerhub_username: ${{ secrets.DOCKERHUB_USERNAME }}
+      dockerhub_token: ${{ secrets.DOCKERHUB_TOKEN }}
+
+  # GHCR packages are created private on first push. GITHUB_TOKEN cannot
+  # change package visibility, so this step uses an optional GHCR_PAT secret
+  # (classic PAT with write:packages). Without the secret it skips and prints
+  # the manual path: repository Packages page -> Package settings ->
+  # Change visibility -> Public.
+  #
+  # Because that skip passes the job, a green package-visibility result says
+  # nothing about whether anyone can pull what the release just wrote -- so a
+  # second step asks the registry with no credentials at all and reports what an
+  # anonymous reader actually sees. It is reporting, not a gate: the tags and
+  # layers are already published by the time this runs, and an unreadable
+  # package is fixed in package settings, not by failing a release.
+  package-visibility:
+    # Not release-8_1 alone: a run now publishes one series, and a skipped
+    # dependency skips its dependents -- so a v5.6.40 tag would have skipped this
+    # job whenever 8.1 was not the one being released. List every release job and
+    # run when at least one of them published and none failed or was cancelled;
+    # if validate or guard stopped the run, all eight are skipped and the
+    # "contains a success" test is what keeps an empty release from reaching here.
+    needs: [release-5_6, release-7_0, release-7_1, release-7_2, release-7_3, release-7_4, release-8_0, release-8_1]
+    if: ${{ always() && contains(needs.*.result, 'success') && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Validate namespace input
+        env:
+          NAMESPACE: ${{ inputs.namespace || 'muffetlab' }}
+        run: |
+          # One path segment: the published ref is <registry>/<namespace>/php,
+          # so a slash or a dot-only value would silently produce a bad name.
+          if ! printf '%s' "$NAMESPACE" | grep -Eq '^[a-zA-Z0-9._-]+$'; then
+            echo "::error::invalid namespace '$NAMESPACE' (expected a GHCR owner, e.g. muffetlab)"
+            exit 1
+          fi
+
+      # The packages API resource name is not the registry path after ghcr.io/:
+      # the package page for the leaf form answers 200 and the one for the slash
+      # form answers 404,
+      #   https://github.com/users/muffetlab/packages/container/package/php        -> 200
+      #   https://github.com/users/muffetlab/packages/container/package/muffetlab%2Fphp -> 404
+      # so for this repository the API package name is `php`, and
+      # `ghcr.io/muffetlab/php` is not the same string as the API resource name.
+      # (The REST equivalent cannot serve as the witness: the packages API answers
+      # 401 to every unauthenticated call, right or wrong name alike -- one reason
+      # the step must not treat a status code as an explanation.)
+      #
+      # 404 from the packages API is deliberately ambiguous: wrong name, token that
+      # cannot see the package, token belonging to a different account, or a package
+      # under the other kind of owner all look identical. A guess-and-PATCH step
+      # cannot tell those apart, so this step asks the API what the owner has before
+      # it tries to change anything, confirms each candidate by reading it back, and
+      # takes the visibility it reports. If that read already says public there is
+      # nothing to PATCH and the correct outcome is "already public", not an error.
+      # Both name forms stay in the candidate list because a fork publishing a
+      # repository-scoped name really does need the slash form.
+      #
+      # Failure here is reported, never fatal. The tags and layers are published
+      # before this runs; a red job at the tail of a good release invites someone to
+      # re-run or re-tag it, which republishes image tags to fix a metadata toggle.
+      # The next step reads the registry back with no credentials, so the log ends
+      # with what a consumer can actually do rather than with this API's opinion.
+      - name: Make GHCR package public (requires GHCR_PAT secret)
+        env:
+          PAT: ${{ secrets.GHCR_PAT }}
+          NAMESPACE: ${{ inputs.namespace || 'muffetlab' }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -eu
+          api="https://api.github.com"
+          manual="GitHub repo -> Packages -> php -> Package settings -> Change visibility -> Public"
+          if [ -z "$PAT" ]; then
+            echo "::notice::GHCR_PAT secret not set - skipping visibility change."
+            echo "::notice::Manual: ${manual}"
+            exit 0
+          fi
+          # A package name can contain a slash; a URL path segment cannot. The API
+          # wants it percent-encoded.
+          enc() { printf '%s' "$1" | sed 's|/|%2F|g'; }
+          # gh <method> <path> <outfile> [json-body] -> prints the HTTP code only.
+          # A transport failure prints 000 rather than aborting the step, because
+          # the answer to "did we reach the API" belongs in the report, not in the
+          # job's exit status.
+          gh() {
+            if [ "$#" -ge 4 ]; then
+              curl -sS --max-time 30 -o "$3" -w '%{http_code}' -X "$1" \
+                -H "Authorization: Bearer $PAT" \
+                -H "Accept: application/vnd.github+json" \
+                -d "$4" "${api}$2" || echo 000
+            else
+              curl -sS --max-time 30 -o "$3" -w '%{http_code}' -X "$1" \
+                -H "Authorization: Bearer $PAT" \
+                -H "Accept: application/vnd.github+json" \
+                "${api}$2" || echo 000
+            fi
+          }
+          # The one field extraction needed: "key":"value". cut -f4 because the
+          # matches are always "key":"value" quoted with ". No jq in this repo.
+          jstr() { grep -o "\"$1\":\"[^\"]*\"" "$2" 2>/dev/null | head -1 | cut -d'"' -f4 || true; }
+
+          # Who is this token? A 404 below is meaningless without knowing whether
+          # the caller is even the package owner -- and fine-grained PATs send no
+          # X-OAuth-Scopes header at all, which is itself worth printing.
+          hdrs="$(mktemp)"; who="$(mktemp)"
+          curl -sS --max-time 30 -D "$hdrs" -o "$who" -H "Authorization: Bearer $PAT" \
+            -H "Accept: application/vnd.github+json" "$api/user" >/dev/null || true
+          login="$(jstr login "$who")"
+          scopes="$(grep -i '^x-oauth-scopes:' "$hdrs" | tr -d '\r\n' | sed 's/^[^:]*: *//' || true)"
+          echo "GHCR_PAT authenticates as: ${login:-<no /user identity returned>}"
+          echo "X-OAuth-Scopes: ${scopes:-<header absent -- fine-grained PATs omit it; a classic PAT needs write:packages>}"
+          if [ -n "$login" ] && [ "$login" != "$OWNER" ]; then
+            echo "::warning::the token's account '$login' is not the repository owner '$OWNER'. /users/<owner> package endpoints only accept the owner's own token, so a cross-account PAT 404s however correct the package name is."
+          fi
+
+          # Candidate names, most likely first: the leaf, then the full registry
+          # path. Both shapes exist in the wild -- user/org-scoped containers are
+          # named by their last segment, repository-scoped ones by <owner>/<name> --
+          # and the slash form is the one that measured 404 here, so it is tried
+          # second and never assumed.
+          candidates="php ${NAMESPACE}/php"
+
+          # What does this token think the owner has? Printed for the log, and the
+          # only honest answer to "is it the name or the token that is wrong".
+          for scope in "users/${OWNER}" "orgs/${OWNER}"; do
+            code="$(gh GET "/${scope}/packages?package_type=container&per_page=100" /tmp/ghcr-pk-list.json)"
+            if [ "$code" = "200" ]; then
+              echo "  ${scope} container packages: $(grep -o '"name":"[^"]*"' /tmp/ghcr-pk-list.json | sed 's/^"name":"//; s/"$//' | sort -u | tr '\n' ' ')"
+            else
+              echo "  ${scope}/packages -> HTTP ${code}"
+            fi
+          done
+
+          tried=""
+          for scope in "users/${OWNER}" "orgs/${OWNER}"; do
+            for name in $candidates; do
+              path="/${scope}/packages/container/$(enc "$name")"
+              code="$(gh GET "$path" /tmp/ghcr-pk.json)"
+              tried="${tried}\n  GET ${path} -> ${code}"
+              [ "$code" = "200" ] || continue
+              vis="$(jstr visibility /tmp/ghcr-pk.json)"
+              echo "Resolved package resource: ${scope} / ${name} (visibility: ${vis:-unknown})"
+              if [ "$vis" = "public" ]; then
+                echo "GHCR package ${name} is already public; no visibility change sent."
+                exit 0
+              fi
+              code="$(gh PATCH "${path}/visibility" /tmp/ghcr-pk.json '{"visibility":"public"}')"
+              tried="${tried}\n  PATCH ${path}/visibility -> ${code}"
+              case "$code" in
+                200|204)
+                  echo "GHCR package ${name} is public (HTTP ${code})"
+                  exit 0 ;;
+                *)
+                  echo "::warning::visibility change refused for ${name} under ${scope} (HTTP ${code}): $(tr -d '\n' < /tmp/ghcr-pk.json)" ;;
+              esac
+            done
+          done
+          printf "%b" "Tried:${tried}\n"
+          echo "::warning::no GHCR package this token could reach matches the published image (${NAMESPACE}/php), so this step changed nothing. The anonymous registry read-back in the next step says whether that matters to a reader. Manual: ${manual}"
+
+      # Reported, never assumed. The visibility step above exits 0 whether it
+      # flipped the package, skipped because GHCR_PAT is absent, or was told the
+      # name lives under another owner -- so "the job is green" has never been
+      # evidence that a reader can pull the release. This asks the registry the
+      # same question a stranger asks it: an unauthenticated token for
+      # scope=repository:<namespace>/php:pull, then GET /v2/<namespace>/php/tags/list.
+      # A public package answers 200 with its tags; a repository no one can read
+      # answers with no token at all and HTTP 403 -- so the two outcomes are
+      # distinguishable without any secret here. No jq and no python, because the workflows in this
+      # repo are bash+awk only, and the only thing parsed is the token field.
+      - name: Confirm an anonymous reader can pull the published address
+        if: ${{ !cancelled() }}
+        env:
+          NAMESPACE: ${{ inputs.namespace || 'muffetlab' }}
+        run: |
+          set -eu
+          repo="${NAMESPACE}/php"
+          manual="GitHub repo -> Packages -> php -> Package settings -> Change visibility -> Public (or set the GHCR_PAT secret and the step above does it)"
+          tok="$(curl -sS --max-time 30 \
+            "https://ghcr.io/token?service=ghcr.io&scope=repository:${repo}:pull" \
+            | grep -o '"token":"[^"]*"' | sed 's/^"token":"//; s/"$//' || true)"
+          if [ -z "$tok" ]; then
+            echo "::warning::ghcr.io issued no anonymous pull token for ${repo}, so nothing here proves a stranger can pull it. ${manual}"
+            exit 0
+          fi
+          body="$(mktemp)"
+          # A transport failure still leaves -w printing 000, so the fallback is
+          # an empty-string default rather than a second || echo (which turned the
+          # message into "HTTP 000000" when stubbed).
+          code="$(curl -sS --max-time 30 -o "$body" -w '%{http_code}' \
+            -H "Authorization: Bearer $tok" "https://ghcr.io/v2/${repo}/tags/list" || true)"
+          code="${code:-000}"
+          if [ "$code" = "200" ]; then
+            echo "Anonymous read of ${repo}: HTTP ${code}; tags a stranger can list: $(tr -d ' \n' < "$body")"
+          else
+            echo "::warning::${repo} is not readable anonymously (HTTP ${code}); the release's tags exist but docker pull without credentials fails. ${manual}"
+          fi

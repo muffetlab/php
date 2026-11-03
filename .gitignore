@@ -1,0 +1,5 @@
+.DS_Store
+# release artifacts
+*.tar.gz
+# generated file is committed on purpose (CI checks drift); keep no backups
+SUPPORTED.md.tmp

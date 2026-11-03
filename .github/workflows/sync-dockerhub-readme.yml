@@ -1,0 +1,78 @@
+name: sync-dockerhub-readme
+
+# Writes the Docker Hub mirror repository's Overview (its "full_description") from
+# README.md, so the page a stranger reads before deciding to pull says what the
+# repository says. It exists because the mirror's Overview was empty while its tags
+# were being pulled: nothing in this repository had ever written it.
+#
+# The release pipeline does this automatically -- build-version.yml's merge job ends
+# with the same script on the cli leg. This workflow is the other half of the deal:
+# run it by hand when the Overview needs refreshing between releases, or when the
+# automated step warned and you want to retry only the Overview without re-pushing a
+# single image tag. Re-running a release for a documentation pane is exactly the
+# mistake the warn-only policy in build-version.yml exists to prevent.
+#
+# Unlike that release step, this one FAILS LOUDLY. A human pressed the button, and
+# the answer they want is "the Overview now says X" or "HTTP 404, there is no
+# <user>/php repository to describe" -- not a green checkmark next to a warning.
+#
+# What it does not touch:
+#   - the images (no registry writes, no docker login, no tags);
+#   - the mirror's short description, the one-line summary under the repository name,
+#     which is hand-tuned and a different sentence from any heading;
+#   - GHCR, whose page is built from the repository README by GitHub itself.
+#
+# Links inside the Overview are rewritten to absolute blob URLs pinned to THIS run's
+# commit (github.com/muffetlab/php/blob/<sha>/MAINTAINING.md). A relative link would
+# resolve against hub.docker.com and 404; a link at HEAD would describe a moving
+# document while the tags on that page were built from one fixed commit.
+#
+# Docker Hub caps full_description at 25000 bytes and truncates silently, so the
+# script measures the payload and refuses to send rather than publish half a README.
+# README.md is around 22k today; the day it grows past the cap this workflow turns
+# red with the number in the message, which is the honest outcome -- a maintainer
+# then decides what the Overview says, not the Hub.
+#
+# Secrets (repository, not environment): DOCKERHUB_USERNAME and DOCKERHUB_TOKEN, the
+# same two the release uses for the mirror. The token needs repository read AND write
+# scope, not just docker login -- see MAINTAINING.md, "The Docker Hub mirror's
+# Overview". If they are absent this run stops with an error naming them, because a
+# dispatch that silently did nothing would be worse than one that failed.
+
+on: workflow_dispatch
+
+concurrency:
+  group: sync-dockerhub-readme
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      # Before any write: the escaper and the link rewriter are pure text work, and
+      # they are the only places a corrupted Overview could go unnoticed until a
+      # person read the live page. Running them on the runner's own sed, awk and curl
+      # proves this runner will produce the same bytes the gate checked.
+      - name: Prove the payload builder on this runner
+        run: ./tools/sync-dockerhub-readme.sh --self-test
+
+      - name: Show what will be sent
+        run: ./tools/sync-dockerhub-readme.sh --dry-run
+
+      - name: Sync the Docker Hub mirror's Overview from README.md
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -eu
+          if [ -z "${DOCKERHUB_USERNAME:-}" ] || [ -z "${DOCKERHUB_TOKEN:-}" ]; then
+            echo "::error::DOCKERHUB_USERNAME and/or DOCKERHUB_TOKEN is not set on this repository, so there is no mirror account to write an Overview for. Set both secrets (the token needs repository read+write) or delete this workflow; the release's mirror steps would skip for the same reason."
+            exit 1
+          fi
+          ./tools/sync-dockerhub-readme.sh

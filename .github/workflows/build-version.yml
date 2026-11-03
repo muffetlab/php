@@ -1,0 +1,869 @@
+name: build-version
+
+# Reusable single-version build: called for every supported series, sequentially,
+# by build-and-verify.yml (test mode), and for one series per run by release.yml
+# (push mode) -- the series a vX.Y.Z tag names, or the series release.yml's
+# version input names.
+#
+# Builds the cli and/or fpm variants declared in manifests/<version>.env and
+# runs smoke + extension tests. Skips cleanly when the manifest is still an
+# unfilled template — the review gates (PATCHSET_APPROVED=1, digest pin,
+# commit pin) are human decisions and CI must not bypass them.
+#
+# Push mode (push=true) is set only by release.yml, and honored only from these
+# refs:
+#   - refs/heads/main or refs/heads/master -- release.yml's workflow_dispatch path
+#   - refs/tags/vX.Y.Z -- a PHP version release. One tag per version: rebuilding
+#     v8.1.34 moves that tag to a new commit instead of adding v8.1.34-2, so the
+#     guard in release.yml rejects any suffixed tag.
+# build-and-verify.yml calls this workflow in test mode (push omitted, so false)
+# and no longer runs on any push: tags belong to release.yml alone. Its trial
+# dispatch adds a second kind of test-mode call: same manifest pins, same suites,
+# with base_image_override naming a candidate Debian base. That knob is refused
+# here when push=true, so "which base did we publish?" always has the manifest as
+# the answer -- and dev.php-legacy.base-image records the base a trial really used.
+#
+# What it publishes:
+#   - Published image is <registry>/<namespace>/php -- by default
+#     ghcr.io/muffetlab/php. The image name is literal ("php"); <namespace> is
+#     the GHCR owner, so a fork must pass its own namespace (its GitHub
+#     user/org) rather than editing this file.
+#   - tags: <registry>/<namespace>/php:<full-php-version>-<variant>
+#           <registry>/<namespace>/php:<minor>-<variant>   (floating)
+#           No :latest-<variant>, and no plain :latest either. A release run
+#           publishes one series, so "latest" would name whichever series someone
+#           tagged last -- not the newest PHP and not a recommendation, and an
+#           unrelated 7.4 rebuild would move it off 8.1. <minor>-<variant> is the
+#           only floating name, and it cannot change the major version.
+#           tools/check-image-name.sh fails if a latest tag comes back.
+#           (the OpenSSL route is deliberately NOT in the tag: the validate job
+#           pins one route per version -- 5.6 -> openssl11, every other series ->
+#           openssl3 -- so the suffix would carry no choice. The route stays in
+#           BUILD-PROVENANCE and the dev.php-legacy.openssl-route label.)
+#   - OCI provenance labels + /opt/php/BUILD-PROVENANCE inside the image
+#   - build provenance/SBOM attestations (GHCR supports them; disable via
+#     attestations=false for registries that do not)
+#   - optional Docker Hub mirror when DOCKERHUB_USERNAME/TOKEN secrets exist
+#
+# Multi-arch: the build matrix covers linux/amd64 and linux/arm64, each on a
+# native runner (ubuntu-24.04 and the GitHub-hosted ubuntu-24.04-arm, which is
+# free for public repositories). Every leg runs the full smoke/extension/composer
+# suite against the image it built, so neither architecture is published on the
+# strength of the other one's tests, and each leg also runs the OS gate over the
+# image's own Debian inventory before anything is pushed. In push mode each leg
+# uploads its image by digest (no per-arch tag) and the merge job assembles the
+# digests into one manifest list per published tag -- a release cannot expose a
+# single-arch tag even if one leg fails, because the merge never runs.
+# imagetools carries each
+# platform's provenance/SBOM attestation manifests into the list, and the merge
+# job reads the list back and says how many it found.
+# Uploading by digest is not the same as pushing: the exporter only publishes
+# when its output spec says push=true, and a leg that forgets it goes green
+# having put nothing in the registry. The push step therefore asks the registry
+# for the digest it was just given before recording it.
+#
+# Runner labels are pinned to Ubuntu 24.04 rather than "ubuntu-latest": GitHub
+# started moving ubuntu-latest to Ubuntu 26.04 on 2026-10-19 (complete by
+# 2026-11-19), and a floating label would change the host OS, its apt packages
+# and its Docker engine under an unattended build. 24.04 is also the release the
+# arm64 label still names, so both legs stay on one Ubuntu version.
+#
+# A private fork cannot use ubuntu-24.04-arm (arm64 hosted runners are free only
+# for public repositories): use a paid arm64 runner label there, or drop the
+# arm64 matrix entry and accept an amd64-only publish.
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+      release:
+        required: false
+        type: boolean
+        default: false
+      push:
+        required: false
+        type: boolean
+        default: false
+      registry:
+        required: false
+        type: string
+        default: ghcr.io
+      namespace:
+        required: false
+        type: string
+        default: muffetlab
+      attestations:
+        required: false
+        type: boolean
+        default: true
+      # Trial knob: replaces the manifest's BASE_IMAGE for this build only.
+      # Set by build-and-verify.yml's trial dispatch, never by release.yml, and
+      # refused outright when push=true. The point is to answer "does this series
+      # build, pass its tests and carry fewer CVEs on a newer Debian?" without
+      # touching a reviewed pin -- the value still has to be digest-pinned, because
+      # an unpinned trial is a result nobody can reproduce.
+      base_image_override:
+        required: false
+        type: string
+        default: ""
+      # Optional uncompressed-MB budget shown in the size report. Reporting
+      # only: it never fails a build.
+      size_budget_mb:
+        required: false
+        type: string
+        default: ""
+    secrets:
+      token:
+        required: true
+      dockerhub_username:
+        required: false
+      dockerhub_token:
+        required: false
+
+jobs:
+  build:
+    # Both legs are pinned to one Ubuntu release: amd64 on ubuntu-24.04, arm64
+    # on ubuntu-24.04-arm. "ubuntu-latest" is deliberately not used -- GitHub
+    # began moving that label to Ubuntu 26.04 on 2026-10-19 (rolling out
+    # through 2026-11-19), so it would silently change the host OS, its apt
+    # packages (shellcheck runs in the validate gate) and its Docker engine
+    # between runs. Moving both labels to 26.04 is a reviewed change: run the
+    # validate gate and one build on ubuntu-26.04 first, and on the arm64 label
+    # for that release once GitHub publishes one.
+    # arm64 is a different, native GitHub-hosted runner: no QEMU, so the PHP
+    # compile costs what it costs on the architecture it targets.
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      packages: write
+      id-token: write # required for provenance/SBOM attestations
+    outputs:
+      # Matrix job outputs are last-writer-wins, so only values that every leg
+      # computes identically may be exported here: manifest readiness is
+      # variant-independent, and push mode depends only on the ref and caller.
+      ready: ${{ steps.state.outputs.ready }}
+      push: ${{ steps.pushmode.outputs.push }}
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [cli, fpm]
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve manifest state
+        id: state
+        env:
+          VERSION: ${{ inputs.version }}
+          VARIANT: ${{ matrix.variant }}
+          BASE_OVERRIDE: ${{ inputs.base_image_override }}
+          PUSH_INPUT: ${{ inputs.push }}
+        run: |
+          set -eu
+          # Trusted project config, not untrusted input.
+          # shellcheck source=/dev/null
+          . "manifests/${VERSION}.env"
+          ready=1
+          for var in BASE_IMAGE SOURCE_REF PHP_SRC_COMMIT; do
+            eval "val=\${$var:-}"
+            case "$val" in ""|*REPLACE_WITH*) ready=0 ;; esac
+          done
+          # A "@sha256:" marker is not a pin: an unfilled manifest ships
+          # "@sha256:REPLACE_WITH_DIGEST", which the substring test above now
+          # catches. Be explicit anyway -- a hand-edited placeholder that only
+          # looks filled must skip, not start a doomed build.
+          case "${BASE_IMAGE:-}" in
+            *@sha256:*)
+              printf '%s' "${BASE_IMAGE##*@sha256:}" | grep -Eq '^[0-9a-f]{64}$' || ready=0
+              ;;
+            *) ready=0 ;;
+          esac
+          [ "${PATCHSET_APPROVED:-0}" = "1" ] || ready=0
+          declared=0
+          for v in ${BUILD_VARIANTS:-}; do
+            [ "$v" = "${VARIANT}" ] && declared=1
+          done
+          # BUILD_PACKAGES / RUNTIME_PACKAGES are interpolated unquoted into
+          # apt-get inside the build, so restrict them to Debian package
+          # specifications (name[:arch][=version]) exactly like build.sh does.
+          pkg_re='^[A-Za-z0-9][A-Za-z0-9.+-]*(:[A-Za-z0-9.+-]+)?(=[A-Za-z0-9.+:~-]+)?$'
+          for list in BUILD_PACKAGES RUNTIME_PACKAGES; do
+            eval "val=\${$list:-}"
+            for tok in $val; do
+              if ! echo "$tok" | grep -Eq "$pkg_re"; then
+                echo "::error::${VERSION}: ${list} contains an invalid package specification: ${tok}"
+                ready=0
+              fi
+            done
+          done
+          # PHP_EXTENSIONS / PECL_EXTENSIONS are additions to the kit baseline,
+          # interpolated unquoted into the build's shell the same way, so they
+          # get the same treatment: shape here (an extension name is
+          # [a-z0-9_]), and which names this series can build at all is the
+          # Dockerfile's availability table, not a second copy of the answer
+          # here. Skipping rather than erroring keeps the parity with every other
+          # unready-manifest check in this step: the build job reports the
+          # refusal, this step just does not start a doomed build.
+          ext_re='^[a-z0-9_]+$'
+          for list in PHP_EXTENSIONS PECL_EXTENSIONS; do
+            eval "val=\${$list:-}"
+            for tok in $val; do
+              if ! echo "$tok" | grep -Eq "$ext_re"; then
+                echo "::error::${VERSION}: ${list} contains an invalid extension name: ${tok}"
+                ready=0
+              fi
+            done
+          done
+          # 1 = ship the configured source tree (official-image parity),
+          # 0 = omit it for image size. Anything else is a typo, not a choice.
+          case "${SHIP_PHP_SOURCE:-1}" in
+            0|1) ;;
+            *)
+              echo "::error::${VERSION}: SHIP_PHP_SOURCE must be 0 or 1 (got '${SHIP_PHP_SOURCE:-}')"
+              ready=0
+              ;;
+          esac
+          # Composer overrides are optional, but when present they must respect
+          # the version policy (Composer 2.x requires PHP >= 7.2.5).
+          cv="${COMPOSER_VERSION:-}"
+          cs="${COMPOSER_SHA256:-}"
+          case "${VERSION}" in
+            5.6|7.0|7.1) policy_cv="1.10.28" ;;
+            *)           policy_cv="2.11.0" ;;
+          esac
+          if [ -n "$cv" ]; then
+            if ! echo "$cv" | grep -Eq '^(1\.10|2)(\.[0-9]+)+$'; then
+              echo "::error::${VERSION}: COMPOSER_VERSION must be an exact 1.10.x or 2.x release (got ${cv})"
+              ready=0
+            fi
+            case "${VERSION}:${cv}" in
+              5.6:2.*|7.0:2.*|7.1:2.*)
+                echo "::error::${VERSION} cannot run Composer 2.x (requires PHP >= 7.2.5)"
+                ready=0
+                ;;
+            esac
+            if [ -z "$cs" ] && [ "$cv" != "$policy_cv" ]; then
+              echo "::warning::${VERSION}: COMPOSER_VERSION=${cv} differs from the policy pin ${policy_cv} and has no COMPOSER_SHA256; the phar digest will not be verified"
+            elif [ -n "$cs" ] && ! echo "$cs" | grep -Eq '^[0-9a-f]{64}$'; then
+              echo "::error::${VERSION}: COMPOSER_SHA256 must be a 64-character lowercase hex SHA-256"
+              ready=0
+            fi
+          fi
+          # --- trial base override -------------------------------------------
+          # base_image_override swaps only the OS base. Every PHP pin -- repo,
+          # commit, source ref, patchset approval -- still comes from the
+          # manifest, so a trial answers "does this series build and carry fewer
+          # CVEs on a newer Debian?" without producing a publishable image. The
+          # override is validated before the skip decision: a malformed trial base
+          # is an operator error and must not be reported as "manifest not ready".
+          effective_base="${BASE_IMAGE}"
+          if [ -n "${BASE_OVERRIDE:-}" ]; then
+            if [ "${PUSH_INPUT}" = "true" ]; then
+              echo "::error::base_image_override is a trial knob and may never be combined with push=true (a trial result is not a publishable image)"
+              exit 1
+            fi
+            # Same rule the manifest pins are held to: a digest, not a tag. An
+            # unpinned trial is a result nobody can reproduce, and the whole
+            # point of the knob is a comparable second data point.
+            case "${BASE_OVERRIDE}" in
+              *@sha256:*)
+                override_digest="${BASE_OVERRIDE##*@sha256:}"
+                ;;
+              *) override_digest="" ;;
+            esac
+            if ! printf '%s' "$override_digest" | grep -Eq '^[0-9a-f]{64}$'; then
+              echo "::error::base_image_override must be pinned by digest (repo[:tag]@sha256:<64 hex>). Resolve one with: ./tools/resolve-base-digest.sh --base debian:trixie-slim"
+              exit 1
+            fi
+            echo "::warning::TRIAL BUILD ${VERSION}/${VARIANT}: base is ${BASE_OVERRIDE} instead of the reviewed ${BASE_IMAGE}. This image is never pushed; the trial result must be reviewed before any manifest pin changes."
+            effective_base="${BASE_OVERRIDE}"
+          fi
+          # Manifest-level readiness is variant-independent; export it for the
+          # merge job. (Per-leg skip is variant-dependent and must not be a job
+          # output: matrix outputs are last-writer-wins.)
+          if [ "$ready" = 1 ]; then echo "ready=yes" >> "$GITHUB_OUTPUT"; else echo "ready=no" >> "$GITHUB_OUTPUT"; fi
+          if [ "$ready" != 1 ] || [ "$declared" != 1 ]; then
+            echo "skip=yes" >> "$GITHUB_OUTPUT"
+            why=""
+            [ "$ready" = 1 ] || why="manifest not ready (unfilled pin or PATCHSET_APPROVED=0)"
+            [ "$declared" = 1 ] || why="${why:+${why}; }variant ${VARIANT} not in BUILD_VARIANTS"
+            echo "::notice::${VERSION}/${VARIANT}: skipping - ${why}"
+          else
+            echo "skip=no" >> "$GITHUB_OUTPUT"
+            # Export resolved pins for later steps via the environment file
+            # (avoids interpolating manifest values into run scripts).
+            {
+              echo "M_BASE_IMAGE=${effective_base}"
+              echo "M_OPENSSL_ROUTE=${OPENSSL_ROUTE}"
+              echo "M_PHP_SRC_REPO=${PHP_SRC_REPO}"
+              echo "M_PHP_SRC_COMMIT=${PHP_SRC_COMMIT}"
+              echo "M_SOURCE_REF=${SOURCE_REF}"
+              echo "M_BUILD_PACKAGES=${BUILD_PACKAGES:-}"
+              echo "M_SHIP_PHP_SOURCE=${SHIP_PHP_SOURCE:-1}"
+              echo "M_RUNTIME_PACKAGES=${RUNTIME_PACKAGES:-}"
+              echo "M_PHP_EXTENSIONS=${PHP_EXTENSIONS:-}"
+              echo "M_PECL_EXTENSIONS=${PECL_EXTENSIONS:-}"
+              echo "M_COMPOSER_VERSION=${cv}"
+              echo "M_COMPOSER_SHA256=${cs}"
+              echo "M_PATCHSET_APPROVED=${PATCHSET_APPROVED}"
+            } >> "$GITHUB_ENV"
+          fi
+
+      # Push mode is only allowed from a default branch or an official release
+      # tag; PRs and forks can never publish, regardless of how the workflow was
+      # triggered. The tag side is deliberately version-shaped rather than a
+      # bare "v*" -- the glob in release.yml is looser, and this is the last
+      # check before an image leaves the building.
+      - name: Determine push mode
+        # Deliberately not gated on the manifest state: this value depends only
+        # on the ref and the caller, so every matrix leg computes the same answer
+        # and the job output the merge job reads is never racy.
+        id: pushmode
+        run: |
+          case "${{ github.ref }}" in
+            refs/heads/main|refs/heads/master|refs/tags/v[0-9]*) allowed=1 ;;
+            *) allowed=0 ;;
+          esac
+          if [ "${{ inputs.push }}" = "true" ]; then
+            # A publishing caller on a ref it may not publish from is a
+            # misconfiguration, not a skip: silently reporting push=false here
+            # would let every leg skip its by-digest push, skip the merge job,
+            # and still colour the release green having published nothing.
+            if [ "$allowed" != 1 ]; then
+              echo "::error::push=true but ${{ github.ref }} may not publish (only refs/heads/main, refs/heads/master and refs/tags/v<version> from release.yml)"
+              exit 1
+            fi
+            echo "push=true" >> "$GITHUB_OUTPUT"
+          else
+            # Test mode (build-and-verify.yml always calls this workflow without
+            # push): build and run every suite, publish nothing.
+            echo "push=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Docker Buildx
+        if: steps.state.outputs.skip == 'no'
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        if: steps.state.outputs.skip == 'no' && steps.pushmode.outputs.push == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.token }}
+
+      - name: Login to Docker Hub (optional mirror)
+        if: steps.state.outputs.skip == 'no' && steps.pushmode.outputs.push == 'true' && env.DOCKERHUB_USER != ''
+        uses: docker/login-action@v4
+        env:
+          DOCKERHUB_USER: ${{ secrets.dockerhub_username }}
+        with:
+          username: ${{ secrets.dockerhub_username }}
+          password: ${{ secrets.dockerhub_token }}
+
+      - name: Build image (gated, cached, load for tests)
+        if: steps.state.outputs.skip == 'no'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          pull: true
+          load: true
+          # A single native platform: load: true cannot load a manifest list, and
+          # testing the image on the architecture that built it is the point.
+          platforms: linux/${{ matrix.arch }}
+          cache-from: type=gha,scope=php-${{ inputs.version }}-${{ matrix.variant }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=php-${{ inputs.version }}-${{ matrix.variant }}-${{ matrix.arch }}
+          # Build-internal tag only (the same name build.sh uses locally) -- it
+          # is never pushed, and it deliberately does not look like a ref of the
+          # published image, which is <registry>/<namespace>/php; see the
+          # "Derive full PHP version and release tags" step.
+          tags: php-legacy-kit:${{ inputs.version }}-${{ matrix.variant }}-test
+          build-args: |
+            BASE_IMAGE=${{ env.M_BASE_IMAGE }}
+            PHP_VERSION=${{ inputs.version }}
+            PHP_VARIANT=${{ matrix.variant }}
+            PHP_SRC_REPO=${{ env.M_PHP_SRC_REPO }}
+            PHP_SRC_COMMIT=${{ env.M_PHP_SRC_COMMIT }}
+            OPENSSL_ROUTE=${{ env.M_OPENSSL_ROUTE }}
+            BUILD_PACKAGES=${{ env.M_BUILD_PACKAGES }}
+            SHIP_PHP_SOURCE=${{ env.M_SHIP_PHP_SOURCE }}
+            RUNTIME_PACKAGES=${{ env.M_RUNTIME_PACKAGES }}
+            PATCHSET_APPROVED=${{ env.M_PATCHSET_APPROVED }}
+            BUILD_SOURCE_REF=${{ env.M_SOURCE_REF }}
+            COMPOSER_VERSION=${{ env.M_COMPOSER_VERSION }}
+            COMPOSER_SHA256=${{ env.M_COMPOSER_SHA256 }}
+            PHP_EXTENSIONS=${{ env.M_PHP_EXTENSIONS }}
+            PECL_EXTENSIONS=${{ env.M_PECL_EXTENSIONS }}
+
+      - name: Smoke tests
+        if: steps.state.outputs.skip == 'no'
+        env:
+          IMAGE: php-legacy-kit:${{ inputs.version }}-${{ matrix.variant }}-test
+          ROUTE: ${{ env.M_OPENSSL_ROUTE }}
+          VARIANT: ${{ matrix.variant }}
+        run: ./tests/smoke.sh "$IMAGE" "$ROUTE" "$VARIANT"
+
+      - name: Extension tests
+        if: steps.state.outputs.skip == 'no'
+        env:
+          IMAGE: php-legacy-kit:${{ inputs.version }}-${{ matrix.variant }}-test
+          ROUTE: ${{ env.M_OPENSSL_ROUTE }}
+        run: ./tests/extensions.sh "$IMAGE" "$ROUTE"
+
+      - name: Composer tests
+        if: steps.state.outputs.skip == 'no'
+        run: ./tests/composer.sh "php-legacy-kit:${{ inputs.version }}-${{ matrix.variant }}-test"
+
+      # --- OS layer: currency and CVE gate -----------------------------------
+      # The PHP source is a reviewed pin; the operating system under it is a Debian
+      # package set, and that set is only knowable from the artifact. So this gate
+      # reads /opt/php/RUNTIME-OS-PACKAGES out of the image the build just produced
+      # (the same inventory tools/verify-runtime.sh re-checks) and asks the image's
+      # own suite what it offers today, instead of trusting a manifest list that
+      # describes the base digest rather than the built image.
+      #
+      # What it fails on is deliberately narrow: a scanner finding whose fix Debian
+      # publishes for *this* suite, and which the image does not already carry -- a
+      # fix this kit could have taken and did not. A finding with no candidate in the
+      # suite is not a defect, it is a row in manifests/OS-CVE-STATUS.md, and the
+      # row's evidence plus review date is what turns "we knew" into something a
+      # stranger can check. There is no ignore list, so a new CVE cannot be silenced
+      # by editing a config file -- only by writing a register row, in the open, with
+      # a reason that survives contact with the Debian tracker. A register row that
+      # cites a version the image no longer contains fails as stale for the same
+      # reason.
+      #
+      # Both steps run before any push: a leg that cannot say which OS packages it
+      # ships does not publish them.
+      - name: Install the pinned trivy (OS CVE gate)
+        if: steps.state.outputs.skip == 'no'
+        # The four SHA-256 digests in tools/install-trivy.sh are filled (checked against
+        # upstream's own checksums file and against the downloaded assets). While they
+        # were empty this step only warned, scan-image.sh found no scanner, classified
+        # nothing, and reported `clean` -- four green legs per run, having scanned
+        # nothing. The tolerance is gone at the gate: an unfilled pin still just warns
+        # here (the value is a human's to commit), but the verdict is then `unverified`
+        # and the leg fails, because an image nobody scanned is not an image that is
+        # free of CVEs. A *filled* pin that does not match the download fails here: that
+        # is upstream rotating the asset or the download arriving from somewhere else,
+        # which is not a thing to build on top of.
+        #
+        # jq is fetched in the same step because scan-image.sh needs it to read the
+        # report. The version is printed before the gate runs, and if jq is somehow
+        # still absent the gate exits 2 naming it, rather than guessing.
+        run: |
+          command -v jq >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq jq; }
+          jq --version
+          ./tools/install-trivy.sh
+
+      - name: OS package currency and CVE gate
+        if: steps.state.outputs.skip == 'no'
+        env:
+          IMAGE: php-legacy-kit:${{ inputs.version }}-${{ matrix.variant }}-test
+        run: |
+          set -eu
+          ./tools/scan-image.sh "$IMAGE" \
+            --json-out "os-cve-${{ inputs.version }}-${{ matrix.variant }}-${{ matrix.arch }}.json"
+
+      # Uploaded with always() because the report is most useful on the leg that
+      # failed: the JSON names each finding, its classification and the register row
+      # (or the absence of one) behind the verdict.
+      - name: Upload the OS CVE report
+        if: steps.state.outputs.skip == 'no' && always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: os-cve-${{ inputs.version }}-${{ matrix.variant }}-${{ matrix.arch }}
+          path: os-cve-${{ inputs.version }}-${{ matrix.variant }}-${{ matrix.arch }}.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      # Reporting only, never gating: the numbers are what a reviewer needs to
+      # decide whether SHIP_PHP_SOURCE=0 or a tighter RUNTIME_PACKAGES list is
+      # worth it for this series. BUDGET_MB is a threshold for the log line, not
+      # a pass/fail, because the right budget depends on the base image chosen.
+      - name: Report image size
+        if: steps.state.outputs.skip == 'no'
+        continue-on-error: true
+        env:
+          IMAGE: php-legacy-kit:${{ inputs.version }}-${{ matrix.variant }}-test
+          LABEL: ${{ inputs.version }}-${{ matrix.variant }}-${{ matrix.arch }}-${{ env.M_OPENSSL_ROUTE }} (SHIP_PHP_SOURCE=${{ env.M_SHIP_PHP_SOURCE }})
+          BUDGET_MB: ${{ inputs.size_budget_mb }}
+        run: ./tools/report-image-size.sh "$IMAGE" "$LABEL"
+
+      - name: Resolve full PHP version
+        id: full
+        if: steps.state.outputs.skip == 'no'
+        env:
+          IMAGE: php-legacy-kit:${{ inputs.version }}-${{ matrix.variant }}-test
+        run: |
+          set -eu
+          full="$(docker run --rm --entrypoint /opt/php/bin/php "$IMAGE" -r 'echo PHP_VERSION;')"
+          [ -n "$full" ] || { echo "::error::could not read PHP_VERSION from the image"; exit 1; }
+          echo "full=$full" >> "$GITHUB_OUTPUT"
+
+      # Digest only: no tag may point at a single architecture. The merge job
+      # below turns the per-arch digests into the manifest list behind every
+      # published tag. The image pushed here is the one whose layers the tests
+      # above exercised; BUILD_MODE/GIT_REVISION only change OCI labels.
+      #
+      # `push=true` inside the output spec is the whole step. `type=image`
+      # without it is buildx's *local-load* exporter: it builds the image,
+      # writes an attestation index for it, prints a digest, exits 0 and puts
+      # nothing in the registry -- a leg that looks green and publishes nothing.
+      # The first v7.4.33 release run did exactly that: four green legs, four
+      # digests, and a registry that did not serve any of the manifests those
+      # digests named -- the only visible symptom was both merge jobs dying on
+      # "ghcr.io/.../php@sha256:cb0cab7f...: not found". Measured
+      # against a local registry:2 with the same output spec: without push=true
+      # the repository gets no manifest revisions at all; with it the digest the
+      # action reports is one of them. So the output spec carries push=true here
+      # and the step after it asks the registry for that exact manifest, which
+      # turns the same mistake into a leg that fails in seconds instead of a
+      # release that fails twenty minutes later with an unreadable ref.
+      - name: Push per-architecture image by digest
+        id: pushdigest
+        if: steps.state.outputs.skip == 'no' && steps.pushmode.outputs.push == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          pull: true
+          platforms: linux/${{ matrix.arch }}
+          cache-from: type=gha,scope=php-${{ inputs.version }}-${{ matrix.variant }}-${{ matrix.arch }}
+          outputs: type=image,name=${{ inputs.registry }}/${{ inputs.namespace }}/php,push=true,push-by-digest=true,name-canonical=true
+          labels: |
+            org.opencontainers.image.title=${{ inputs.namespace }}/php ${{ steps.full.outputs.full }} ${{ matrix.variant }}
+            org.opencontainers.image.version=${{ steps.full.outputs.full }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.url=${{ github.server_url }}/${{ github.repository }}/blob/${{ github.event.repository.default_branch || 'master' }}/SUPPORTED.md
+            dev.php-legacy.variant=${{ matrix.variant }}
+            dev.php-legacy.openssl-route=${{ env.M_OPENSSL_ROUTE }}
+            dev.php-legacy.source-commit=${{ env.M_PHP_SRC_COMMIT }}
+            dev.php-legacy.base-image=${{ env.M_BASE_IMAGE }}
+          provenance: ${{ inputs.attestations }}
+          sbom: ${{ inputs.attestations }}
+          build-args: |
+            BASE_IMAGE=${{ env.M_BASE_IMAGE }}
+            PHP_VERSION=${{ inputs.version }}
+            PHP_VARIANT=${{ matrix.variant }}
+            PHP_SRC_REPO=${{ env.M_PHP_SRC_REPO }}
+            PHP_SRC_COMMIT=${{ env.M_PHP_SRC_COMMIT }}
+            OPENSSL_ROUTE=${{ env.M_OPENSSL_ROUTE }}
+            BUILD_PACKAGES=${{ env.M_BUILD_PACKAGES }}
+            SHIP_PHP_SOURCE=${{ env.M_SHIP_PHP_SOURCE }}
+            RUNTIME_PACKAGES=${{ env.M_RUNTIME_PACKAGES }}
+            PATCHSET_APPROVED=${{ env.M_PATCHSET_APPROVED }}
+            BUILD_SOURCE_REF=${{ env.M_SOURCE_REF }}
+            COMPOSER_VERSION=${{ env.M_COMPOSER_VERSION }}
+            COMPOSER_SHA256=${{ env.M_COMPOSER_SHA256 }}
+            PHP_EXTENSIONS=${{ env.M_PHP_EXTENSIONS }}
+            PECL_EXTENSIONS=${{ env.M_PECL_EXTENSIONS }}
+            BUILD_MODE=ci
+            GIT_REVISION=${{ github.sha }}
+
+      - name: Export digest
+        if: steps.state.outputs.skip == 'no' && steps.pushmode.outputs.push == 'true'
+        env:
+          ARCH: ${{ matrix.arch }}
+          VARIANT: ${{ matrix.variant }}
+          REPO: ${{ inputs.registry }}/${{ inputs.namespace }}/php
+          ACTION_DIGEST: ${{ steps.pushdigest.outputs.digest }}
+          FULL_VERSION: ${{ steps.full.outputs.full }}
+        run: |
+          set -eu
+          # The action's `digest` output is buildx's `containerimage.digest`: the
+          # digest of what it PUT at the canonical name. With provenance/SBOM on
+          # that is the attestation *index* over the image manifest, with them off
+          # it is the image manifest; both are what `imagetools create` needs, and
+          # measured locally `containerimage.descriptor` agrees with it, so there
+          # is nothing to second-guess here. What it does not prove is that the
+          # push happened -- which is why the registry is asked, right below.
+          pushed="${ACTION_DIGEST}"
+          if ! printf '%s' "$pushed" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::the push step reported no usable digest for ${VARIANT}/${ARCH} (got '${pushed}'), so the merge job would be handed a reference that cannot exist"
+            exit 1
+          fi
+          # Ask the registry for exactly this manifest. This is the check that
+          # would have caught the v7.4.33 run at the leg instead of at the merge.
+          if ! raw="$(docker buildx imagetools inspect --raw "${REPO}@${pushed}" 2>&1)"; then
+            printf '%s\n' "$raw"
+            echo "::error::${REPO}@${pushed} is not served by the registry: this leg built an image but published nothing (a type=image output without push=true loads locally and exits 0). Refusing to record a digest the merge job cannot resolve."
+            exit 1
+          fi
+          media="$(printf '%s\n' "$raw" | awk -F'"' '/mediaType/{print $4; exit}')"
+          mkdir -p "${RUNNER_TEMP}/digests"
+          echo "$pushed" > "${RUNNER_TEMP}/digests/${ARCH}.digest"
+          # Identical on both legs; the merge job needs it for tag names.
+          echo "${FULL_VERSION}" > "${RUNNER_TEMP}/digests/full.version"
+          echo "Registry serves ${REPO}@${pushed} as ${media:-an untyped manifest}; recorded ${ARCH} digest for ${VARIANT}"
+
+      - name: Upload digest
+        if: steps.state.outputs.skip == 'no' && steps.pushmode.outputs.push == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ inputs.version }}-${{ matrix.variant }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Export image tarball
+        if: steps.state.outputs.skip == 'no' && inputs.release && steps.pushmode.outputs.push != 'true'
+        run: |
+          set -eu
+          out="php-legacy-kit-${{ inputs.version }}-${{ matrix.variant }}-${{ matrix.arch }}.tar.gz"
+          docker save "php-legacy-kit:${{ inputs.version }}-${{ matrix.variant }}-test" | gzip > "$out"
+          # The artifact is what a reviewer downloads; the uncompressed number is
+          # in the size report above, this one says what the build weighs on disk.
+          echo "Compressed tarball: $(du -h "$out" | cut -f1) (uncompressed image size is in the size report step)"
+
+      - name: Upload artifact
+        if: steps.state.outputs.skip == 'no' && inputs.release && steps.pushmode.outputs.push != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: php-legacy-kit-${{ inputs.version }}-${{ matrix.variant }}-${{ matrix.arch }}
+          path: php-legacy-kit-${{ inputs.version }}-${{ matrix.variant }}-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  # --- Assemble the multi-arch manifest list ---------------------------------
+  # Runs only in push mode and only for a release-ready manifest. Each variant
+  # merges the linux/amd64 and linux/arm64 digests built above; both legs must
+  # have finished (and passed their tests) before this runs, and a failure in
+  # either leg means no published tag is created at all. Per-platform
+  # provenance/SBOM attestation manifests are carried into the list by
+  # imagetools, which merges the children of each index it is given.
+  merge:
+    needs: build
+    if: needs.build.outputs.ready == 'yes' && needs.build.outputs.push == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [cli, fpm]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Is this variant declared for the version
+        id: declared
+        env:
+          VERSION: ${{ inputs.version }}
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          set -eu
+          # Trusted project config, not untrusted input.
+          # shellcheck source=/dev/null
+          . "manifests/${VERSION}.env"
+          declared=no
+          for v in ${BUILD_VARIANTS:-}; do
+            [ "$v" = "$VARIANT" ] && declared=yes
+          done
+          echo "declared=${declared}" >> "$GITHUB_OUTPUT"
+
+      - name: Download per-architecture digests
+        if: steps.declared.outputs.declared == 'yes'
+        uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-${{ inputs.version }}-${{ matrix.variant }}-*
+          merge-multiple: true
+
+      - name: Login to GHCR
+        if: steps.declared.outputs.declared == 'yes'
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.token }}
+
+      - name: Login to Docker Hub (optional mirror)
+        if: steps.declared.outputs.declared == 'yes' && env.DOCKERHUB_USER != ''
+        env:
+          DOCKERHUB_USER: ${{ secrets.dockerhub_username }}
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.dockerhub_username }}
+          password: ${{ secrets.dockerhub_token }}
+
+      - name: Create manifest list and publish tags
+        if: steps.declared.outputs.declared == 'yes'
+        env:
+          REGISTRY: ${{ inputs.registry }}
+          NAMESPACE: ${{ inputs.namespace }}
+          VERSION: ${{ inputs.version }}
+          VARIANT: ${{ matrix.variant }}
+          GH_REF: ${{ github.ref }}
+          DOCKERHUB_USER: ${{ secrets.dockerhub_username }}
+        run: |
+          set -eu
+          cd "${RUNNER_TEMP}/digests"
+          repo="${REGISTRY}/${NAMESPACE}/php"
+          [ -s full.version ] || { echo "::error::full.version missing from the digest artifacts"; exit 1; }
+          full="$(cat full.version)"
+          [ -n "$full" ] || { echo "::error::full.version is empty"; exit 1; }
+          # Exactly the platforms this workflow promises. A missing digest is a
+          # partial release, and a partial release must not publish a tag.
+          refs=""
+          for arch in amd64 arm64; do
+            [ -s "${arch}.digest" ] || { echo "::error::no ${arch} image digest was uploaded"; exit 1; }
+            refs="${refs} ${repo}@$(cat "${arch}.digest")"
+          done
+          # The published address is spelled out here, literally, because
+          # tools/check-image-name.sh reads it back out of this workflow and
+          # holds the docs to it.
+          repos="${REGISTRY}/${NAMESPACE}/php"
+          if [ -n "${DOCKERHUB_USER}" ]; then repos="${repos} ${DOCKERHUB_USER}/php"; fi
+          # A tag run must publish the series that tag names. release.yml's guard
+          # rejects anything else before a build job runs, and this restates the
+          # rule immediately before a floating tag is written: a caller that
+          # widened the chain again would otherwise repoint <minor>-<variant> at an
+          # unreviewed rebuild of a different series.
+          case "${GH_REF}" in
+            refs/tags/*)
+              tag="${GH_REF#refs/tags/}"
+              if printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+                tag_series="$(printf '%s' "${tag#v}" | cut -d. -f1,2)"
+                if [ "$tag_series" != "$VERSION" ]; then
+                  echo "::error::release tag $tag names series $tag_series but this build is $VERSION; refusing to publish floating tags for the wrong series"
+                  exit 1
+                fi
+              fi
+              ;;
+          esac
+          # The builder is only used to talk to the registry here, but its version
+          # and driver are the first things to suspect when a publish fails, so the
+          # step records them.
+          docker buildx version
+          publish_one() { # <registry/repo> -- one manifest list per registry
+            local repo="$1" tags="" out
+            # Fully-qualified tag: exact PHP version + variant, the shape the
+            # official php image uses. The route is not in the name; read it
+            # from BUILD-PROVENANCE or the OCI label if it matters.
+            tags="-t ${repo}:${full}-${VARIANT}"
+            # Floating convenience tag for the minor series. It is the only moving
+            # name this pipeline writes, and by construction it cannot change the
+            # major version. There is no :latest-<variant> and no plain :latest.
+            tags="${tags} -t ${repo}:${VERSION}-${VARIANT}"
+            # shellcheck disable=SC2086  # word-splitting the tag/ref lists is the point
+            if ! out="$(docker buildx imagetools create ${tags} ${refs} 2>&1)"; then
+              printf '%s\n' "$out"
+              # Publishing logs get truncated in the Actions UI, but an annotation
+              # is shown even then -- and naming the repository that failed is what
+              # separates "GHCR refused us" from "the Docker Hub mirror refused us".
+              echo "::error::imagetools create failed for ${repo}: $(printf '%s\n' "$out" | tail -n 3 | tr '\n' ' ')"
+              return 1
+            fi
+            printf '%s\n' "$out"
+            echo "Published ${repo} ${full}-${VARIANT} from:${refs}"
+          }
+          # One imagetools call per registry, primary first: a single call carrying
+          # both registries loses the GHCR tags if the mirror refuses, and its error
+          # cannot say which registry is at fault. The mirror still fails the job --
+          # half a release is not a release -- but only after GHCR is published.
+          for r in $repos; do
+            publish_one "$r"
+          done
+
+      - name: Verify the manifest list covers both architectures
+        if: steps.declared.outputs.declared == 'yes'
+        env:
+          REGISTRY: ${{ inputs.registry }}
+          NAMESPACE: ${{ inputs.namespace }}
+          VERSION: ${{ inputs.version }}
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          set -eu
+          ref="${REGISTRY}/${NAMESPACE}/php:${VERSION}-${VARIANT}"
+          out="$(docker buildx imagetools inspect "$ref")"
+          printf '%s\n' "$out"
+          for p in linux/amd64 linux/arm64; do
+            printf '%s\n' "$out" | grep -Eq "Platform: *${p}([[:space:],]|$)" \
+              || { echo "::error::${ref} manifest list does not contain ${p}"; exit 1; }
+          done
+
+      # Reporting only. `imagetools create` merges the children of each index it
+      # is given, so the per-arch provenance/SBOM attestation manifests ride into
+      # the published list -- the first published image proves it (7.4-cli, run
+      # 41288106152: every linux/amd64 and linux/arm64 entry is followed by an
+      # attestation manifest carrying an SPDX SBOM and an SLSA provenance v1
+      # statement). Counting them here is what turns "the registry supports
+      # attestations" from an assumption into a line in the release log.
+      #
+      # The counter has to follow the format buildx actually writes. Attestations
+      # go out in the *docker* format: the index child is an OCI manifest
+      # annotated `vnd.docker.reference.type: attestation-manifest` whose **layers**
+      # are the `application/vnd.in-toto+json` statements. The in-toto media type
+      # never appears in the index itself, so a first version of this step that
+      # grepped for it reported zero attestations on an image that had two -- a
+      # false alarm about a missing audit trail is worse than no report, because
+      # people stop reading the reports. Both formats are counted; absent
+      # attestations with attestations=true stays a warning, not a failure, since
+      # the tags and layers a consumer pulls are already correct.
+      - name: Report what the manifest list carries
+        if: steps.declared.outputs.declared == 'yes'
+        continue-on-error: true
+        env:
+          REGISTRY: ${{ inputs.registry }}
+          NAMESPACE: ${{ inputs.namespace }}
+          VERSION: ${{ inputs.version }}
+          VARIANT: ${{ matrix.variant }}
+          ATTEST: ${{ inputs.attestations }}
+        run: |
+          set -eu
+          ref="${REGISTRY}/${NAMESPACE}/php:${VERSION}-${VARIANT}"
+          raw="$(docker buildx imagetools inspect --raw "$ref")"
+          # Occurrences, not lines: today inspect --raw pretty-prints one key per
+          # line, and a compact index would make a line count read 1 for ten.
+          n_docker="$(printf '%s\n' "$raw" | grep -o 'attestation-manifest' | wc -l | tr -d ' ' || true)"
+          n_intoto="$(printf '%s\n' "$raw" | grep -o 'application/vnd.in-toto+json' | wc -l | tr -d ' ' || true)"
+          n_att=$((n_docker + n_intoto))
+          # Real platforms only: an attestation entry sits in the list as
+          # unknown/unknown, so the text form's linux/ lines are the count.
+          n_plat="$(docker buildx imagetools inspect "$ref" | grep -c 'Platform: *linux/' || true)"
+          echo "${ref}: ${n_plat} linux platform entries, ${n_att} attestation manifests (attestations=${ATTEST})"
+          if [ "$ATTEST" != "false" ] && [ "$n_att" -eq 0 ]; then
+            echo "::warning::attestations were requested but ${ref} carries none; the images are published, the audit trail is the BUILD-PROVENANCE label and this run's logs"
+          fi
+
+      # The Docker Hub mirror's Overview, from the README of the commit that was
+      # just published. Same reason the GHCR visibility step reads the answer back
+      # instead of asserting it: the repository page is what a stranger looks at
+      # before deciding to pull, and it had never been written by anything here, so
+      # it sat empty while tags were being pulled off it.
+      #
+      # Gated to matrix.variant == 'cli' on purpose. Both merge legs publish, but
+      # the Overview is one piece of metadata for the whole <user>/php repository --
+      # two legs would PATCH the identical body twice, and if one leg failed the
+      # other's green run would read as "synced" for a release that half-synced.
+      # One leg, named, is the honest version of that.
+      #
+      # continue-on-error because by this point the tags and layers are published:
+      # a red step at the tail of a good release invites someone to re-run it, and
+      # re-running this job re-pushes image tags to fix a documentation pane. The
+      # script itself does not soften the outcome -- it prints a ::error:: naming
+      # the HTTP code and whether the token or the repository is at fault.
+      #
+      # The mirror test is in the shell, not the "if:", on purpose. GitHub does not
+      # give a step condition the secrets context (only env/vars/steps/matrix), so
+      # an expression here could not prove the secret exists -- it would read an
+      # unset env var as the empty string and skip quietly, which is the same as the
+      # answer for "no mirror configured". Saying which of the two happened is worth
+      # a line of output, and the line below can only be reached with both set.
+      - name: Sync the Docker Hub mirror's Overview from README.md
+        if: steps.declared.outputs.declared == 'yes' && matrix.variant == 'cli'
+        continue-on-error: true
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.dockerhub_username }}
+          DOCKERHUB_TOKEN: ${{ secrets.dockerhub_token }}
+        run: |
+          set -eu
+          if [ -z "${DOCKERHUB_USERNAME:-}" ] || [ -z "${DOCKERHUB_TOKEN:-}" ]; then
+            echo "No Docker Hub mirror secrets on this repository, so there is no <user>/php repository to write an Overview for, and nothing here was skipped by accident. This is the no-mirror case: the publish step above composed one registry instead of two."
+            exit 0
+          fi
+          ./tools/sync-dockerhub-readme.sh

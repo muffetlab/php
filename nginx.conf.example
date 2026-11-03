@@ -1,0 +1,45 @@
+# Copy to ./nginx.conf (docker-compose.example.yml mounts it there), then change
+# server_name, fastcgi_pass and root to match your app.
+#
+# About $document_root, because it is the first line people suspect when FastCGI
+# does not resolve:
+#
+# 1. It is not a host variable. Nginx documents it as "root or alias directive's
+#    value for the current request" (ngx_http_core_module), so inside a container
+#    it is the `root` line below and nothing about the machine running Docker
+#    enters it.
+# 2. It IS resolved by php-fpm, in the FPM container's filesystem. SCRIPT_FILENAME
+#    crosses the network as a path string, so both containers must mount the app
+#    at the same path -- docker-compose.example.yml does exactly that
+#    (./app:/var/www/html:ro on the nginx service and on every php*fpm service).
+#    Mounting the app at different paths on the two sides is the configuration
+#    that produces "Primary script unknown", which reads like a Docker or
+#    permissions bug and is neither.
+# 3. If /var/www/html reaches the app through a symlink, use
+#    $realpath_root$fastcgi_script_name instead: same value with all symlinks
+#    resolved, which is what a backend validating paths prefers.
+#
+# This block is HTTP only. Publishing 443 needs a certificate and a second
+# server{}; keep 9000 unpublished either way -- it is on the internal network.
+
+server {
+    listen 80;
+    server_name example.invalid;
+    root /var/www/html;
+    index index.php index.html;
+
+    location / {
+        try_files $uri $uri/ /index.php$is_args$args;
+    }
+
+    location ~ \.php$ {
+        try_files $uri =404;
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        fastcgi_pass php56:9000;
+    }
+
+    location ~ /\.(?!well-known) {
+        deny all;
+    }
+}
