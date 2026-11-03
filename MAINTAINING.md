@@ -478,6 +478,15 @@ an OS; it only constrains it, because a series built against OpenSSL 1.1 needs a
 base that still ships 1.1 — which is what `OPENSSL_ROUTE` records, and why 5.6 sits
 on bullseye while 7.0–7.3 sit on bookworm and 7.4–8.1 sit on trixie (the 2026-11-03
 base split; both newer bases ship OpenSSL 3.x, so the `openssl3` route spans them).
+**Deployed images and manifests can disagree on the base between splits**: the
+7.4/8.0/8.1 tags currently in the registry were built on bookworm, and their
+manifests now pin trixie, so those tags stay bookworm until each series' next
+release run publishes from trixie. The registry keeps its own truth — the digest
+of a tag changes at publish time, and SUPPORTED.md's generated "Published tags"
+section reads the digests live, so a consumer anchoring on a digest cannot be
+surprised by this sentence going stale. (The per-series digest records that
+preceded this live-read mechanism lived in manifests/SECURITY-REVIEW.md and were
+retired when the generator took over; the publications themselves are unchanged.)
 Changing a base is therefore a reviewed manifest change, not a Dockerfile edit.
 
 **A digest-pinned base freezes the OS too.** That pin is the reason a rebuild is

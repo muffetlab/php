@@ -1,14 +1,59 @@
 #!/usr/bin/env bash
-# Regenerates SUPPORTED.md from manifests/*.env and the machine-readable
-# status table in manifests/SECURITY-REVIEW.md.
+# Regenerates SUPPORTED.md from manifests/*.env, the machine-readable
+# status table in manifests/SECURITY-REVIEW.md, and the live registry:
+# which tags exist and their deploy digests are read from ghcr.io at
+# generation time, so the generated "Published tags" section is the
+# registry's own answer and can never drift from it.
 # SUPPORTED.md is generated — do not edit it by hand. CI fails if the
-# committed file drifts from the generator output.
+# committed file drifts from the generator output, and the generator fails
+# loudly (exit non-zero) if the registry is unreachable: no output at all
+# is better than an output that cannot say what it verified.
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="${ROOT}/SUPPORTED.md"
 # version-branch: series-allowlist
 SUPPORTED_VERSIONS="5.6 7.0 7.1 7.2 7.3 7.4 8.0 8.1"
+# The published address the release workflow composes. A fork regenerates
+# against its own registry namespace by overriding this.
+GHCR_HOST="${GHCR_HOST:-ghcr.io}"
+GHCR_REPO="${GHCR_REPO:-muffetlab/php}"
+
+REGISTRY_TIMEOUT="${REGISTRY_TIMEOUT:-30}"
+
+ghcr_token() {
+  # Pull-scope anonymous token, exactly as the release records verified the
+  # registry with; jq -e makes an unparseable answer a hard failure.
+  curl -fsS --max-time "$REGISTRY_TIMEOUT" \
+    "https://${GHCR_HOST}/token?scope=repository:${GHCR_REPO}:pull" \
+    | jq -e -r .token
+}
+
+registry_tags_list() {
+  # $1 = pull token. One full tag name per line. This list IS the "which tags
+  # exist" fact; the generator's Release tags section only re-states it.
+  curl -fsS --max-time "$REGISTRY_TIMEOUT" \
+    -H "Authorization: Bearer ${1}" \
+    "https://${GHCR_HOST}/v2/${GHCR_REPO}/tags/list" \
+    | jq -e -r '.tags[]'
+}
+
+registry_has_tag() {
+  # $1 = tag. jq renders one tag per argument-free line, so membership is an
+  # exact whole-line match.
+  grep -Fqx -- "$1" <<<"$tags_list"
+}
+
+digest_for_tag() {
+  # $1 = pull token, $2 = tag. The manifest GET's Docker-Content-Digest
+  # response header IS the list digest the release records verified by hand
+  # on 2026-11-03.
+  curl -fsS --max-time "$REGISTRY_TIMEOUT" -D- -o /dev/null \
+    -H "Authorization: Bearer ${1}" \
+    -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+    "https://${GHCR_HOST}/v2/${GHCR_REPO}/manifests/${2}" \
+    | awk 'tolower($1)=="docker-content-digest:"{sub(/\r$/, "", $2); print $2; exit}'
+}
 
 status_for() {
   # Parse rows of the form: | <version> | <status> |  from SECURITY-REVIEW.md.
@@ -33,42 +78,26 @@ status_for() {
 }
 
 published_for() {
-  # Which variants of this series a release run has actually written, as a
-  # sorted "cli fpm" list (empty when none). The source is the release record
-  # in manifests/SECURITY-REVIEW.md: the run that published a series records a
-  # per-variant digest table whose rows carry both the registry-qualified tag
-  # (`ghcr.io/muffetlab/php:<minor>-<variant>`) and the deploy digest. Parsing
-  # that record — rather than naming the published set by hand anywhere — is
-  # what makes the published state self-maintaining: a series appears here exactly
-  # when its release record does, a release cannot be published without being
-  # announced, and no announcement can claim a tag the record does not have.
-  # A parse that finds nothing for every series is loudly wrong (an empty
-  # Release tags section contradicts any release in the record), so the drift
-  # check cannot pass silently on it.
-  local ver="$1"
-  awk -v ver="$ver" '
-    BEGIN { r = ver; gsub(/\./, "\\.", r) }
-    /sha256:/ {
-      s = $0
-      while (match(s, /ghcr\.io\/muffetlab\/php:[0-9][0-9.]*-[a-z]+/)) {
-        # "ghcr.io/muffetlab/php:" is exactly 22 characters.
-        t = substr(s, RSTART + 22, RLENGTH - 22)
-        if (t ~ "^" r "-[a-z]+$") {
-          v = t; sub("^" r "-", "", v); print v
-        } else if (t ~ "^" r "\\.[0-9.]+-[a-z]+$") {
-          v = t; sub("^" r "(\\.[0-9.]+)*-", "", v); print v
-        }
-        s = substr(s, RSTART + RLENGTH)
-      }
-    }
-  ' "${ROOT}/manifests/SECURITY-REVIEW.md" 2>/dev/null | sort -u | tr '\n' ' '
+  # Which variants of this series the registry currently serves, as a sorted
+  # "cli fpm" list (empty when none). $2 carries the manifest's BUILD_VARIANTS
+  # list, so the names asked for are exactly the series' declared variants --
+  # a stray tag naming something else can never widen this. The source is the
+  # registry itself: /v2/<repo>/tags/list read with an anonymous pull-scope
+  # token at generation time.
+  local ver="$1" out=""
+  for variant in ${2:-}; do
+    if registry_has_tag "${ver}-${variant}"; then
+      out="${out}${variant} "
+    fi
+  done
+  printf '%s' "${out% }"
 }
 
 {
   echo "# Supported versions"
   echo
   echo "<!-- GENERATED by tools/gen-supported.sh — do not edit by hand. -->"
-  echo "<!-- Source of truth: manifests/*.env + manifests/SECURITY-REVIEW.md status table. -->"
+  echo "<!-- Source of truth: manifests/*.env + manifests/SECURITY-REVIEW.md status table + the live registry (tags and digests read at generation time). -->"
   echo
   echo "Read [DISCLAIMER.md](DISCLAIMER.md) and [SECURITY.md](SECURITY.md) before using"
   echo "any image from this project. A row below being filled in does **not** mean the"
@@ -189,36 +218,47 @@ published_for() {
   echo "Every name above is written by a release run: a push of an exact \`vX.Y.Z\` tag,"
   echo "or a manual dispatch that names the series. Both write the same two names."
   echo
-  echo "Which tags exist is a release-history fact, read from the record and not"
-  echo "asserted here by hand. A series appears below exactly when its release record"
-  echo "in [manifests/SECURITY-REVIEW.md](manifests/SECURITY-REVIEW.md) carries the"
-  echo "published digest table for its variants; until its own first release run has"
-  echo "written that, none of this series' tags exist and a \`docker pull\` of them"
-  echo "fails with \`manifest unknown\`:"
-  echo
+  reg_tok="$(ghcr_token)"
+  tags_list="$(registry_tags_list "$reg_tok")"
+  if [ -z "$(printf '%s' "$tags_list" | tr -d '[:space:]')" ]; then
+    echo "::error::${GHCR_HOST}/${GHCR_REPO}: reachable but serves no tags; the Release tags section would be silently empty, so generation stops here" >&2
+    exit 1
+  fi
+  gen_stamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   listed_any=0
+  echo "Which tags exist is a live registry fact: this generator reads \`/tags/list\`"
+  echo "with an anonymous pull-scope token and records what it answers, at"
+  echo "generation time (${gen_stamp}). A series appears when the registry serves"
+  echo "its variants; each variant's two names must resolve to the same digest and"
+  echo "the generator fails the run if they do not:"
+  echo
   for v in $SUPPORTED_VERSIONS; do
-    pub="$(published_for "$v")"
-    [ -n "$pub" ] || continue
-    listed_any=1
     f="${ROOT}/manifests/${v}.env"
+    [ -f "$f" ] || continue
     # Trusted project configuration, same source the table above reads.
     # shellcheck source=/dev/null
-    full="$( . "$f"; printf '%s' "${SOURCE_REF:-}" )"
+    . "$f"
+    pub="$(published_for "$v" "${BUILD_VARIANTS:-}")"
+    [ -n "$pub" ] || { unset SOURCE_REF BUILD_VARIANTS; continue; }
+    listed_any=1
     set -f
     # shellcheck disable=SC2086
-    set -- $pub
-    tags=""
-    for variant in "$@"; do
-      tags="${tags}\`${full}-${variant}\` / \`${v}-${variant}\`, "
+    row=""
+    for variant in $pub; do
+      d_minor="$(digest_for_tag "$reg_tok" "${v}-${variant}")"
+      d_full="$(digest_for_tag "$reg_tok" "${SOURCE_REF}-${variant}")"
+      if [ "$d_minor" != "$d_full" ]; then
+        echo "::error::${v}: \`${v}-${variant}\` and \`${SOURCE_REF}-${variant}\` resolve to different digests (${d_minor:?} vs ${d_full:?})" >&2
+        exit 1
+      fi
+      row="${row}\`${variant}\` \`${v}-${variant}\` / \`${SOURCE_REF}-${variant}\` → \`${d_minor}\`, "
     done
     set +f
-    tags="${tags%, }"
-    echo "- ${v}: ${tags} at \`ghcr.io/muffetlab/php\`."
-    echo "  The deploy digests are in the series' release record described above."
+    echo "- ${v}: ${row%, }"
+    unset SOURCE_REF BUILD_VARIANTS
   done
   if [ "$listed_any" = 0 ]; then
-    echo "- No series has a release record with a published digest table yet."
+    echo "- No tags for any series at generation time."
   fi
   echo
   echo "Each tag is a multi-arch manifest list covering \`linux/amd64\` and"

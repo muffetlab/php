@@ -392,34 +392,18 @@ re-derive it.
   `merge` jobs were skipped and **nothing was published to a registry**: a green
   CI row is evidence the image builds and behaves, not evidence that a tag
   exists to pull.
-- The **7.4** series was published on 2026-11-01, as two multi-arch manifest
-  lists:
-
-  | Tag | Digest (both `7.4.33-*` and `7.4-*` resolve to it) |
-  | --- | --- |
-  | `ghcr.io/muffetlab/php:7.4-cli` / `:7.4.33-cli` | `sha256:fe4f7774a85a74e3dc843c15a73885dccefca326bed9bb91bc2e1e175f8472fd` |
-  | `ghcr.io/muffetlab/php:7.4-fpm` / `:7.4.33-fpm` | `sha256:a048017bcc95d4de0450ccba8673d666330c7dfab6247c2cc3f2fb4da2b2ea61` |
-
-  Each list carries `linux/amd64` and `linux/arm64` plus one attestation manifest
-  per platform, and each attestation manifest holds an SPDX SBOM and a SLSA
-  provenance v1 statement — read back off the registry, not inferred from the
-  workflow. The published `7.4-cli` list was then pulled anonymously on 2026-11-01
-  and run on `linux/arm64`: `php -r 'echo PHP_VERSION, PHP_SAPI'` reported
-  `7.4.33cli`, and the image's own `/usr/local/bin/verify-runtime` returned
-  `VERIFY-RUNTIME OK` (all promised modules load, no unresolved libraries, runtime
-  OpenSSL 3.0.22 on the `openssl3` route) against the digest in the table above.
-  Public visibility is recorded the same way, and **not** as something the run
-  achieved: its `package-visibility` job passed while printing
-  `GHCR_PAT secret not set - skipping visibility change.` — that secret is absent
-  from this repository, so the package became public by the manual route. What an
-  unauthenticated reader gets today is an anonymous `GET /v2/muffetlab/php/tags/list`
-  answering HTTP 200 with exactly `7.4.33-cli`, `7.4-cli`, `7.4.33-fpm`, `7.4-fpm`
-  and nothing else. No `latest-<variant>` was written: this run was a manual
-  dispatch, and at that commit only an exact `vX.Y.Z` tag run could move `latest`.
-  That name has since left the pipeline — on 2026-11-02 the publish step was
-  reduced to `<full>-<variant>` and `<minor>-<variant>`, so no run writes a latest
-  tag at all now (MAINTAINING.md, "Publishing images"). Deploy the digest,
-  not the floating tag, if you need this record to bind to what you actually run.
+- The publish record for a series — which tags exist and what digest each
+  resolves to — used to be tabled in this file, series by series (7.4 first on
+  2026-11-01, the remaining six verified against the registry on 2026-11-03).
+  That is now a generated fact instead of a maintained one: SUPPORTED.md's
+  "Release tags" section reads `ghcr.io/muffetlab/php`'s `/tags/list` and each
+  tag's `Docker-Content-Digest` at generation time (`tools/gen-supported.sh`),
+  so the registry remains the only source and the tables here could not go
+  stale. Some per-run evidence those tables carried — the attestation/SBOM
+  layout, the anonymous pull-and-run check, and the 7.4 `package-visibility`
+  job passing while `GHCR_PAT` was unset (the `7.4-cli`/`7.4-fpm` packages
+  became public by the manual route, on 2026-11-01) — stays true as of its
+  date and is not re-verified by the generator.
 - 5.6's base digest is pinned, and the local image ID matches that digest. The
   other seven manifests pin the same `debian:bookworm-slim` index digest
   (`sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3`,
@@ -427,59 +411,12 @@ re-derive it.
   all seven built from it on both architectures in the CI run above.
   **On 2026-11-03 this changed for three of the seven: 7.4, 8.0 and 8.1 moved to
   `debian:trixie-slim@sha256:f6b08b09…` by the base split** (the trials that
-  measured it are in MAINTAINING.md; the published images named above are still
-  the bookworm builds, so this paragraph's deploy digests stay valid for what is
-  on the registry today — the next release build of those three series publishes
-  from trixie). 7.0–7.3 keep the bookworm digest; they do not compile on trixie.
+  measured it are in MAINTAINING.md). 7.4's first release from trixie was
+  published on 2026-11-04, so its deployed digests moved then (they are read
+  live, per the bullet above); 8.0 and 8.1 remain bookworm until their next
+  release runs. 7.0–7.3 keep the bookworm digest; they do not compile on trixie.
   `tools/resolve-base-digest.sh --check` reports it if a tag moves.
 
-### The remaining six series' releases (verified against the registry 2026-11-03)
-
-These facts were verified directly on the date in the heading — an
-anonymous registry token, `GET /v2/muffetlab/php/tags/list` (28 tags, 5.6 the
-only one missing), and `GET /v2/muffetlab/php/manifests/<tag>` per variant
-above — not copied from run logs. Series-to-run mapping comes from each run's
-series-gated `merge` job names.
-
-**Run numbers predate a repository reset.** The release-run numbers and the CI
-chain that earned the `tested-in-CI` rows ran on the repository instance that
-existed before the reset; reconstructed from the public run list on 2026-11-04.
-If that instance is re-created, the numbers and the logs behind them stop
-resolving. What stays independently verifiable here is the registry side: every
-digest in this file can be re-read today from `ghcr.io/muffetlab/php` (an
-anonymous token plus `GET /v2/muffetlab/php/manifests/<tag>` returns the list
-digest in `Docker-Content-Digest`), and the `tested-in-CI` statuses are
-re-established empirically by dispatching `build-and-verify` against the
-re-created instance — when that run lands, add its date here.
-
-| Series | Release run (number) | Run date (UTC) | Note |
-| --- | --- | --- | --- |
-| 8.0 | 41308384375 | 2026-11-01 | |
-| 8.1 | 41308677246 | 2026-11-01 | |
-| 7.3 | 41379484915 | 2026-11-02 | |
-| 7.2 | 41381808799 | 2026-11-02 | its only failing job is `package-visibility`, as with 7.4 above; all four builds and both `merge` jobs passed, and the digests below were read from the registry |
-| 7.1 | 41388688262 | 2026-11-02 | |
-| 7.0 | 41396869463 | 2026-11-02 | |
-
-| Tag | Digest (both `<full>-*` and `<minor>-*` resolve to it) |
-| --- | --- |
-| `ghcr.io/muffetlab/php:7.0-cli` / `:7.0.33-cli` | `sha256:e0803ef8dafcb942a1c2ccdec3f74e185ea7775f56ba2084104b36a2aedd4180` |
-| `ghcr.io/muffetlab/php:7.0-fpm` / `:7.0.33-fpm` | `sha256:d258bc3b271145ed7d4cc568f800effb27f05016b1c3c42cd06b616d1da68dee` |
-| `ghcr.io/muffetlab/php:7.1-cli` / `:7.1.33-cli` | `sha256:9c5b838338a3f33e588b9d62a0abde268bee7dc198f30f4ccbc28c6628833440` |
-| `ghcr.io/muffetlab/php:7.1-fpm` / `:7.1.33-fpm` | `sha256:b7ed1e71f1bb8f24d6a05cce22f992adf7bba0b74972a3c86ceb1cf063594f0e` |
-| `ghcr.io/muffetlab/php:7.2-cli` / `:7.2.34-cli` | `sha256:a1865f96a8355ba01a0248c4cea12b9437c41e12f3e08d52e0d05cde1146ea31` |
-| `ghcr.io/muffetlab/php:7.2-fpm` / `:7.2.34-fpm` | `sha256:cc57e47f79691a5b3d9f380637a3fc6a77159fd3f9573eb9916ef68e9b48d687` |
-| `ghcr.io/muffetlab/php:7.3-cli` / `:7.3.33-cli` | `sha256:024779fa3a14df6c9ca93f790bfd5eafa13a63e4cb5fcafc69a99fa4bab021b8` |
-| `ghcr.io/muffetlab/php:7.3-fpm` / `:7.3.33-fpm` | `sha256:53473a98763cdc84de6a789aa6be910cf8913673ddef6138c918fc0c3ad12b82` |
-| `ghcr.io/muffetlab/php:8.0-cli` / `:8.0.30-cli` | `sha256:9bf17071e6e1e4802f0906e57fa7dc1445c672ecbd4565e879b95fe6093f9a45` |
-| `ghcr.io/muffetlab/php:8.0-fpm` / `:8.0.30-fpm` | `sha256:867fc65dab7add2220b99b9c614e274c17e9ae19be18ad22399d8baefaff8b0b` |
-| `ghcr.io/muffetlab/php:8.1-cli` / `:8.1.34-cli` | `sha256:5d0f628b4205839f6b664c23f66712e7ba7eccf5f7d1042f031d38b46b9aa36f` |
-| `ghcr.io/muffetlab/php:8.1-fpm` / `:8.1.34-fpm` | `sha256:011d26068187d4501e7cd65094c01259de0cdf9228338079b4e3a5ab5948ee54` |
-
-5.6 alone has no tags and no release run as of the date in this heading. These
-rows, like the 7.4 record above, name the **publish** digest; they do not claim
-an in-image `verify-runtime` pass for these six series until it is that series'
-own record (the registry date is the only thing this section vouches for).
 - No CVE other than the two named above has been assessed for any series. A
   release decision must re-check current PHP and OS-library advisories on the
   release date.
@@ -489,16 +426,6 @@ own record (the registry date is the only thing this section vouches for).
   here and a fresh approval.
 
 [backports]: https://github.com/shivammathur/php-src-backports
-
-
-Status should be one of:
-- `unreviewed`
-- `patch-present-not-tested`
-- `tested-in-CI`
-- `approved-for-staging`
-- `approved-for-production`
-
-Only the last status should permit production release under your release process.
 
 ## Bundled third-party components
 
@@ -573,14 +500,15 @@ What `tested-in-CI` does **not** claim, and what no row should be read as:
 
 - **A published tag is a separate fact from a green row.** The verification chain
   that earned these rows runs in test mode, so its `merge` jobs were skipped and
-  nothing it built reached a registry. Two release runs have happened since: the
-  first (`v7.4.33`, 2026-11-01) failed — its four 7.4 legs built and tested green
-  but handed the merge a digest for an image they had loaded locally rather than
-  pushed, so the registry had no such manifest — and the second (a
-  `workflow_dispatch`, same day) published **7.4 only**:
-  `7.4.33-cli`/`7.4-cli`/`7.4.33-fpm`/`7.4-fpm` exist, no `latest` name does (the
-  pipeline publishes none — see MAINTAINING.md, "Publishing images"), and none of
-  the other seven series had a tag at that run's date. A green CI row is evidence
+  nothing it built reached a registry. The first release attempt (`v7.4.33`,
+  2026-11-01) failed — its four 7.4 legs built and tested green but handed the
+  merge a digest for an image they had loaded locally rather than pushed, so the
+  registry had no such manifest — and the successful runs that followed
+  (7.4 on 2026-11-01, the six other series through 2026-11-02, and 7.4 again on
+  2026-11-04 now that its manifest builds from trixie) are what its tags exist.
+  Which tags exist, and the digest each resolves to today, is read from the
+  registry by `tools/gen-supported.sh` into SUPPORTED.md — this file's row is
+  not that fact. A green CI row is evidence
   the image builds and behaves; it has never been evidence that a tag exists.
 - **The CVE hunks are still untested.** The suite exercises the extension surface
   and the FPM pool, not the bailout fix; see the caveats under the CVE table.
