@@ -227,11 +227,12 @@ published_for() {
   gen_stamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   listed_any=0
   echo "Which tags exist is a live registry fact: this generator reads \`/tags/list\`"
-  echo "with an anonymous pull-scope token and records what it answers, at"
-  echo "generation time (${gen_stamp}). A series appears when the registry serves"
-  echo "its variants; each variant's two names must resolve to the same digest and"
+  echo "with an anonymous pull-scope token and records what it answers, at the"
+  echo "time stamped below. A series appears when the registry serves its"
+  echo "variants; each variant's two names must resolve to the same digest and"
   echo "the generator fails the run if they do not:"
   echo
+  echo "<!-- generated at ${gen_stamp} -->"
   for v in $SUPPORTED_VERSIONS; do
     f="${ROOT}/manifests/${v}.env"
     [ -f "$f" ] || continue

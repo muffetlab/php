@@ -118,9 +118,11 @@ jobs:
       - name: SUPPORTED.md up to date
         run: |
           ./tools/gen-supported.sh
-          if ! git diff --quiet -- SUPPORTED.md; then
+          # The generation-time stamp line advances on every run, so the
+          # comparison excludes it rather than failing on its own freshness.
+          if ! git diff --quiet --ignore-matching-lines='^<!-- generated at ' -- SUPPORTED.md; then
             echo "::error::SUPPORTED.md is stale; run tools/gen-supported.sh and commit"
-            git diff -- SUPPORTED.md
+            git diff --ignore-matching-lines='^<!-- generated at ' -- SUPPORTED.md
             exit 1
           fi
 
