@@ -35,25 +35,39 @@ registry/namespace inputs compose `<registry>/<namespace>/php`; a fork passes
 its own namespace) and carry:
 
 - `ghcr.io/muffetlab/php:<minor>-<variant>` — recommended deploy tag; moves only within its own series
-- `ghcr.io/muffetlab/php:<full-php-version>-<variant>` — fully-qualified exact tag
+- `ghcr.io/muffetlab/php:<full-php-version>-r<revision>-<variant>` — immutable exact tag; `8.1.34-r1-fpm` is the first image built from PHP 8.1.34, `8.1.34-r2-fpm` the rebuild after an OS CVE fix
+
+Four things each carry one job, and none of them is "which PHP version to
+build": a git tag (`v1.0.0`) marks the source commit a release was made from,
+the workflow_dispatch `version` input picks the scope (`all` or one series),
+`manifests/<series>.env` holds the PHP version, and the Docker tag names the
+image that came out. Adding a series is a new manifest plus a new row in the
+allowlist -- the release mechanism does not change.
 
 There is no `latest` tag, and none is published for any variant: a release run
-publishes one PHP series, so a `latest` name would resolve to whichever series
-was tagged last -- not the newest, and it could move backwards on an unrelated
-rebuild. `<minor>-<variant>` is the only floating name and cannot change major
-version. Choose the series from the table above; MAINTAINING.md ("Publishing
+publishes the series it selects -- one series for a single-series dispatch,
+every supported series at once for `version=all` -- so a `latest` name
+would resolve to whichever series was released last: not the newest, and an
+unrelated rebuild of one series could move it backwards. `<minor>-<variant>` is
+the only floating name and it cannot change major version. Choose the series
+from the table above; MAINTAINING.md ("Publishing
 images") records why.
 
-Every name above is written by a release run: a push of an exact `vX.Y.Z` tag,
-or a manual dispatch that names the series. Both write the same two names.
+Every name above is written by one release run -- a manual dispatch of
+`release.yml` that names the scope (`all` or a series) and the image revision,
+from a commit that carries a `vX.Y.Z` source release tag. Both names are
+written by the same run for each series it publishes.
 
 Which tags exist is a live registry fact: this generator reads `/tags/list`
 with an anonymous pull-scope token and records what it answers, at the
 time stamped below. A series appears when the registry serves its
-variants; each variant's two names must resolve to the same digest and
-the generator fails the run if they do not:
+variants; for each variant the row names the floating tag and the exact
+tag with the highest image revision the registry serves, and the two must
+resolve to the same digest (an older revision for the same version may
+still be in the registry as the snapshot it is, and is not compared). The
+generator fails the run if they do not:
 
-<!-- generated at 2026-11-03T17:24:43Z -->
+<!-- generated at 2026-11-04T15:16:53Z -->
 - 7.0: `cli` `7.0-cli` / `7.0.33-cli` → `sha256:e0803ef8dafcb942a1c2ccdec3f74e185ea7775f56ba2084104b36a2aedd4180`, `fpm` `7.0-fpm` / `7.0.33-fpm` → `sha256:d258bc3b271145ed7d4cc568f800effb27f05016b1c3c42cd06b616d1da68dee`
 - 7.1: `cli` `7.1-cli` / `7.1.33-cli` → `sha256:9c5b838338a3f33e588b9d62a0abde268bee7dc198f30f4ccbc28c6628833440`, `fpm` `7.1-fpm` / `7.1.33-fpm` → `sha256:b7ed1e71f1bb8f24d6a05cce22f992adf7bba0b74972a3c86ceb1cf063594f0e`
 - 7.2: `cli` `7.2-cli` / `7.2.34-cli` → `sha256:a1865f96a8355ba01a0248c4cea12b9437c41e12f3e08d52e0d05cde1146ea31`, `fpm` `7.2-fpm` / `7.2.34-fpm` → `sha256:cc57e47f79691a5b3d9f380637a3fc6a77159fd3f9573eb9916ef68e9b48d687`
@@ -72,8 +86,19 @@ suffix could not express a choice. It is in `BUILD-PROVENANCE` and the
 `dev.php-legacy.openssl-route` label instead, and the per-version table above
 lists it.
 
-There is one tag per PHP version (`v8.1.34`): rebuilding that version moves
-the existing tag instead of adding a `-<rev>` suffix.
+Exact tags are never moved, and there is one per image built from a PHP
+version: `8.1.34-r1-cli` is the first, and `8.1.34-r2-cli` the rebuild that
+carries an OS security fix -- the PHP version did not change, the image
+revision did. Reading the highest revision out of the registry is therefore
+the same as reading the newest image, and a deployment can pin an exact name
+knowing it will always mean the bytes it was first pushed as. The name that
+moves is `<minor>-<variant>`, which every release run repoints at that run's
+build, so a deployment that pinned an exact name has to move to the newer
+revision (or to `<minor>-<variant>`) to receive a fix.
+
+A git tag is not part of an image name and does not pick a PHP version:
+`v1.0.0` marks the source commit a release was made from, and a run refuses
+to publish from a commit that carries no such tag.
 
 Every published image embeds `/opt/php/BUILD-PROVENANCE` (base image digest,
 source repo/ref/commit, OpenSSL route and version, PECL extension pins,
@@ -84,6 +109,9 @@ matching OCI labels; release pushes attach provenance/SBOM attestations where
 the registry supports them.
 
 Only rows whose manifest is fully pinned **and** `PATCHSET_APPROVED=1` are ever
-built and published. A release run names one series: if that series' manifest is
-unpinned or unapproved the run fails instead of publishing nothing quietly.
+built and published. A release run publishes the series it selects -- one for a
+single-series dispatch, all supported series for a `version=all`
+dispatch -- and a selected series whose manifest is unpinned or unapproved fails
+the whole run rather than publishing part of a release quietly; a full release
+checks every selected manifest before it pushes any image.
 Series a release did not select are skipped, not force-released.

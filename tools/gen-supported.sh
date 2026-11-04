@@ -2,7 +2,7 @@
 # Regenerates SUPPORTED.md from manifests/*.env, the machine-readable
 # status table in manifests/SECURITY-REVIEW.md, and the live registry:
 # which tags exist and their deploy digests are read from ghcr.io at
-# generation time, so the generated "Published tags" section is the
+# generation time, so the generated "Release tags" section is the
 # registry's own answer and can never drift from it.
 # SUPPORTED.md is generated — do not edit it by hand. CI fails if the
 # committed file drifts from the generator output, and the generator fails
@@ -91,6 +91,45 @@ published_for() {
     fi
   done
   printf '%s' "${out% }"
+}
+
+current_exact_tag() {
+  # $1 = SOURCE_REF (the PHP version this manifest pins), $2 = variant. Among the
+  # exact names the registry serves for that version -- <version>-r<revision>-
+  # <variant>, the shape the release pipeline writes -- print the one with the
+  # highest image revision.
+  #
+  # A bare <version>-<variant> is read as revision 0. Those are the names published
+  # before a revision was mandatory, when a rebuild of the same PHP version had
+  # nothing to leave behind; every release from here on writes -r<N>, so the bare
+  # name stays in the registry as the snapshot it is and never gains a sibling with
+  # the same number.
+  #
+  # The floating name has to agree with *this* one. Every earlier exact name is
+  # still in the registry as the snapshot it was published as, so comparing
+  # <minor>-<variant> against the newest one would fail from the second build of
+  # any version onwards -- and would have been describing the wrong image all
+  # along.
+  local ver="$1" variant="$2" best="" bestn=-1 t n
+  # Newline-separated registry tags; no tag name can contain a space or a glob
+  # character, so plain word splitting is the intended read here.
+  # shellcheck disable=SC2086
+  for t in $tags_list; do
+    case "$t" in
+      "${ver}-${variant}") n=0 ;;
+      "${ver}-r"*"-${variant}")
+        n="${t#"${ver}-r"}"
+        n="${n%"-${variant}"}"
+        printf '%s' "$n" | grep -Eq '^[0-9]+$' || continue
+        n="$((10#$n))" ;;
+      *) continue ;;
+    esac
+    if [ "$n" -gt "$bestn" ]; then
+      bestn="$n"
+      best="$t"
+    fi
+  done
+  printf '%s' "$best"
 }
 
 {
@@ -206,17 +245,28 @@ published_for() {
   echo "its own namespace) and carry:"
   echo
   echo "- \`ghcr.io/muffetlab/php:<minor>-<variant>\` — recommended deploy tag; moves only within its own series"
-  echo "- \`ghcr.io/muffetlab/php:<full-php-version>-<variant>\` — fully-qualified exact tag"
+  echo "- \`ghcr.io/muffetlab/php:<full-php-version>-r<revision>-<variant>\` — immutable exact tag; \`8.1.34-r1-fpm\` is the first image built from PHP 8.1.34, \`8.1.34-r2-fpm\` the rebuild after an OS CVE fix"
+  echo
+  echo "Four things each carry one job, and none of them is \"which PHP version to"
+  echo "build\": a git tag (\`v1.0.0\`) marks the source commit a release was made from,"
+  echo "the workflow_dispatch \`version\` input picks the scope (\`all\` or one series),"
+  echo "\`manifests/<series>.env\` holds the PHP version, and the Docker tag names the"
+  echo "image that came out. Adding a series is a new manifest plus a new row in the"
+  echo "allowlist -- the release mechanism does not change."
   echo
   echo "There is no \`latest\` tag, and none is published for any variant: a release run"
-  echo "publishes one PHP series, so a \`latest\` name would resolve to whichever series"
-  echo "was tagged last -- not the newest, and it could move backwards on an unrelated"
-  echo "rebuild. \`<minor>-<variant>\` is the only floating name and cannot change major"
-  echo "version. Choose the series from the table above; MAINTAINING.md (\"Publishing"
+  echo "publishes the series it selects -- one series for a single-series dispatch,"
+  echo "every supported series at once for \`version=all\` -- so a \`latest\` name"
+  echo "would resolve to whichever series was released last: not the newest, and an"
+  echo "unrelated rebuild of one series could move it backwards. \`<minor>-<variant>\` is"
+  echo "the only floating name and it cannot change major version. Choose the series"
+  echo "from the table above; MAINTAINING.md (\"Publishing"
   echo "images\") records why."
   echo
-  echo "Every name above is written by a release run: a push of an exact \`vX.Y.Z\` tag,"
-  echo "or a manual dispatch that names the series. Both write the same two names."
+  echo "Every name above is written by one release run -- a manual dispatch of"
+  echo "\`release.yml\` that names the scope (\`all\` or a series) and the image revision,"
+  echo "from a commit that carries a \`vX.Y.Z\` source release tag. Both names are"
+  echo "written by the same run for each series it publishes."
   echo
   reg_tok="$(ghcr_token)"
   tags_list="$(registry_tags_list "$reg_tok")"
@@ -229,8 +279,11 @@ published_for() {
   echo "Which tags exist is a live registry fact: this generator reads \`/tags/list\`"
   echo "with an anonymous pull-scope token and records what it answers, at the"
   echo "time stamped below. A series appears when the registry serves its"
-  echo "variants; each variant's two names must resolve to the same digest and"
-  echo "the generator fails the run if they do not:"
+  echo "variants; for each variant the row names the floating tag and the exact"
+  echo "tag with the highest image revision the registry serves, and the two must"
+  echo "resolve to the same digest (an older revision for the same version may"
+  echo "still be in the registry as the snapshot it is, and is not compared). The"
+  echo "generator fails the run if they do not:"
   echo
   echo "<!-- generated at ${gen_stamp} -->"
   for v in $SUPPORTED_VERSIONS; do
@@ -246,13 +299,18 @@ published_for() {
     # shellcheck disable=SC2086
     row=""
     for variant in $pub; do
-      d_minor="$(digest_for_tag "$reg_tok" "${v}-${variant}")"
-      d_full="$(digest_for_tag "$reg_tok" "${SOURCE_REF}-${variant}")"
-      if [ "$d_minor" != "$d_full" ]; then
-        echo "::error::${v}: \`${v}-${variant}\` and \`${SOURCE_REF}-${variant}\` resolve to different digests (${d_minor:?} vs ${d_full:?})" >&2
+      exact="$(current_exact_tag "$SOURCE_REF" "$variant")"
+      if [ -z "$exact" ]; then
+        echo "::error::${v}: the registry serves \`${v}-${variant}\` but no exact tag for the PHP version this manifest pins (\`${SOURCE_REF}\`) -- expected \`${SOURCE_REF}-r<N>-${variant}\`, or the bare \`${SOURCE_REF}-${variant}\` a pre-revision release published; the generator cannot say which build the floating tag points at" >&2
         exit 1
       fi
-      row="${row}\`${variant}\` \`${v}-${variant}\` / \`${SOURCE_REF}-${variant}\` → \`${d_minor}\`, "
+      d_minor="$(digest_for_tag "$reg_tok" "${v}-${variant}")"
+      d_full="$(digest_for_tag "$reg_tok" "$exact")"
+      if [ "$d_minor" != "$d_full" ]; then
+        echo "::error::${v}: \`${v}-${variant}\` and the highest-revision exact tag \`${exact}\` resolve to different digests (${d_minor:?} vs ${d_full:?})" >&2
+        exit 1
+      fi
+      row="${row}\`${variant}\` \`${v}-${variant}\` / \`${exact}\` → \`${d_minor}\`, "
     done
     set +f
     echo "- ${v}: ${row%, }"
@@ -272,8 +330,19 @@ published_for() {
   echo "\`dev.php-legacy.openssl-route\` label instead, and the per-version table above"
   echo "lists it."
   echo
-  echo "There is one tag per PHP version (\`v8.1.34\`): rebuilding that version moves"
-  echo "the existing tag instead of adding a \`-<rev>\` suffix."
+  echo "Exact tags are never moved, and there is one per image built from a PHP"
+  echo "version: \`8.1.34-r1-cli\` is the first, and \`8.1.34-r2-cli\` the rebuild that"
+  echo "carries an OS security fix -- the PHP version did not change, the image"
+  echo "revision did. Reading the highest revision out of the registry is therefore"
+  echo "the same as reading the newest image, and a deployment can pin an exact name"
+  echo "knowing it will always mean the bytes it was first pushed as. The name that"
+  echo "moves is \`<minor>-<variant>\`, which every release run repoints at that run's"
+  echo "build, so a deployment that pinned an exact name has to move to the newer"
+  echo "revision (or to \`<minor>-<variant>\`) to receive a fix."
+  echo
+  echo "A git tag is not part of an image name and does not pick a PHP version:"
+  echo "\`v1.0.0\` marks the source commit a release was made from, and a run refuses"
+  echo "to publish from a commit that carries no such tag."
   echo
   echo "Every published image embeds \`/opt/php/BUILD-PROVENANCE\` (base image digest,"
   echo "source repo/ref/commit, OpenSSL route and version, PECL extension pins,"
@@ -284,8 +353,11 @@ published_for() {
   echo "the registry supports them."
   echo
   echo "Only rows whose manifest is fully pinned **and** \`PATCHSET_APPROVED=1\` are ever"
-  echo "built and published. A release run names one series: if that series' manifest is"
-  echo "unpinned or unapproved the run fails instead of publishing nothing quietly."
+  echo "built and published. A release run publishes the series it selects -- one for a"
+  echo "single-series dispatch, all supported series for a \`version=all\`"
+  echo "dispatch -- and a selected series whose manifest is unpinned or unapproved fails"
+  echo "the whole run rather than publishing part of a release quietly; a full release"
+  echo "checks every selected manifest before it pushes any image."
   echo "Series a release did not select are skipped, not force-released."
 } > "${OUT}.tmp"
 

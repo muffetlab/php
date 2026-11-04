@@ -18,16 +18,22 @@ checked against them: every published image embeds
 re-audit those claims in place.
 
 What is published is decided by [SUPPORTED.md](SUPPORTED.md), not by this
-README. Every manifest is pinned and approved, so none is skipped for being
+file. Every manifest is pinned and approved, so none is skipped for being
 unready, and as of 2026-11-01 every series has been built and tested in CI on
 both architectures, which is what its `tested-in-CI` review status claims. That
 status claims neither more nor less than that: it is not an approval
 (`approved-*` needs a named reviewer), it does not mean the CVE fixes were
-exercised by a test, and it does not mean there is an image to pull. As of
-2026-11-01 the only series with tags in the registry is **7.4**
-(`ghcr.io/muffetlab/php:7.4.33-cli`, `:7.4-cli`, `:7.4.33-fpm`, `:7.4-fpm`); the
-other seven have none, and there is no `latest` tag in the registry or in the
-pipeline for them to acquire later.
+exercised by a test, and it does not mean there is an image to pull. Which tags
+exist is a live registry fact, so this file does not enumerate them by hand:
+[SUPPORTED.md](SUPPORTED.md)'s generated "Release tags" section is the authority,
+read out of `ghcr.io/muffetlab/php`'s tag list at generation time — at the last
+generation (2026-11-04) it recorded `<minor>-<variant>` and its
+`<full-php-version>-<variant>` for seven series, and no tags at all for 5.6,
+whose release run has not written any name yet. Those exact names were written
+before the image revision existed; a release from here writes the immutable
+`<full-php-version>-r<revision>-<variant>` beside them and never rewrites one.
+There is no `latest` tag in the
+registry or in the pipeline for any series to acquire later.
 
 [backports]: https://github.com/shivammathur/php-src-backports
 

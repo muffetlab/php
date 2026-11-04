@@ -12,15 +12,17 @@
 # address.
 #
 # Also checks the two places a rename typically gets missed:
-#   - release.yml repeats the namespace fallback in every release job
+#   - release.yml repeats the namespace fallback where it calls the reusable
+#     workflow and where it names the package
 #   - the GHCR package-visibility job must name the package by the image path
 #     after ghcr.io/ (namespace/php), not by an invented one
 # and the local build tag (build.sh + its README examples), which is never
 # pushed but is still an image name the documentation shows people.
 #
-# The release tag scheme and the trigger ownership are checked here too because
-# they are the same class of consistency: which ref produces a published image,
-# and which workflow is allowed to act on it.
+# The release naming model is checked here too because it is the same class of
+# consistency: which ref may produce a published image, what each of the four
+# version-shaped things (git tag, dispatch input, manifest, Docker tag) is
+# responsible for, and which workflow is allowed to act on it.
 #
 # Usage: ./tools/check-image-name.sh   (exit 0 = consistent, 1 = drift)
 set -eu
@@ -123,34 +125,85 @@ if ! grep -Fq "${local_repo}:<version>-<variant>-test" MAINTAINING.md; then
   err "MAINTAINING.md: does not document the local build tag ${local_repo}:<version>-<variant>-test"
 fi
 
-# Release tag scheme. The "-legacy" suffix was dropped (v8.1.34, not
-# v8.1.34-legacy), and the trigger glob is now the loose "v*", so the shape rule
-# has to live in code: assert the trigger, the guard job and the build job agree,
-# and that the docs still state the one-tag-per-version rule the user chose --
-# rebuilding a version moves v8.1.34 rather than publishing v8.1.34-2.
-tag_trigger="$(sed -n 's/^      - "\(v[^"]*\)"$/\1/p' "$release_wf" | head -1)"
-if [ "$tag_trigger" != "v*" ]; then
-  err "${release_wf}: the tag trigger is '${tag_trigger:-unset}', expected 'v*' (documented everywhere as vX.Y.Z)"
+# Release naming model. Four version-shaped things, four separate jobs: a git tag
+# marks a source release (vMAJOR.MINOR.PATCH), the workflow_dispatch input picks
+# the scope (one series or all), manifests/<series>.env holds the PHP version, and
+# the Docker tag names the image that came out (<minor>-<variant> floating,
+# <full>-r<revision>-<variant> immutable). The assertions below are what keeps that
+# division from sliding back: a tag push trigger or a build number inside a tag
+# would put "which PHP version" and "which build" into the git ref again, which is
+# the coupling that made a full release cost eight tags.
+
+# release.yml is dispatch-only. A tag listener would have to parse the ref to know
+# what to build, and the only thing a ref can say is a version.
+if grep -Eq '^  push:' "$release_wf"; then
+  err "${release_wf}: has a push: trigger again; the scope of a release is a workflow_dispatch input, not a git tag -- a tag trigger puts PHP version selection back into refs/tags (see MAINTAINING.md 'Publishing images')"
 fi
-# Exact form: no optional suffix. If a suffix ever comes back, that is a change
-# to the release policy, and it has to be made here and in the docs together.
+if ! grep -Eq '^  workflow_dispatch:' "$release_wf"; then
+  err "${release_wf}: has no workflow_dispatch trigger; this is the only release entry point"
+fi
+
+# The source release tag shape, as one literal in both files that check it: the
+# guard that reads the dispatched commit and the callee that refuses push=true.
+# Third number, then end of string -- a suffix group here is a build number living
+# in a git tag again, which is the model this gate just retired.
+src_tag_shape='^v[0-9]+\.[0-9]+\.[0-9]+$'
 for site in "$release_wf" "$build_wf"; do
-  if ! grep -Fq "^v[0-9]+\\.[0-9]+\\.[0-9]+\$" "$site"; then
-    err "${site}: the release tag shape is no longer exactly vX.Y.Z (one tag per PHP version)"
+  if ! grep -Fq -- "$src_tag_shape" "$site"; then
+    err "${site}: no longer requires exactly ${src_tag_shape} for a source release tag (a git tag marks source, nothing else)"
   fi
 done
-if grep -Eq '\(\-\[0-9A-Za-z\]' "$release_wf" "$build_wf"; then
-  err "a release tag regex accepts a suffix again; rebuilds move the existing vX.Y.Z tag instead (see MAINTAINING.md 'Publishing images')"
+# shellcheck disable=SC2016
+if grep -Fq -- '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?$' "$release_wf" "$build_wf"; then
+  err "a workflow still accepts vX.Y.Z-<N> as a release tag; the build number belongs in the image name (-r<revision>), not the git tag"
 fi
-if ! grep -Fq 'refs/tags/v[0-9]*' "$build_wf"; then
-  err "${build_wf}: push is no longer restricted to version-shaped tags (refs/tags/v[0-9]*)"
+
+# The image revision is what distinguishes two builds of the same PHP version, and
+# it is part of every published exact name.
+# These are literal workflow text, single-quoted because nothing here may expand.
+# shellcheck disable=SC2016
+if ! grep -Fq -- 'exact="${full}-r${REVISION}-${VARIANT}"' "$build_wf"; then
+  err "${build_wf}: the immutable name is no longer composed as <full>-r<revision>-<variant>, so a rebuild would overwrite the snapshot the revision exists to protect"
 fi
-if ! grep -Fq 'names PHP series' "$release_wf"; then
-  err "${release_wf}: the guard job no longer cross-checks the tag's PHP series against the supported list"
+# shellcheck disable=SC2016
+for site in "$release_wf" "$build_wf"; do
+  grep -Fq -- '^[1-9][0-9]*$' "$site" || err "${site}: no longer requires a positive integer image revision before it can become part of a published name"
+done
+# Publishing is only allowed from the default branch, and only with a source
+# release tag: a tag ref may not publish anything, because the ref no longer says
+# what to build. Both halves are the callee's own gate, not just release.yml's.
+# shellcheck disable=SC2016
+for want in \
+  'refs/heads/main|refs/heads/master) allowed=1 ;;' \
+  'SOURCE_RELEASE: ${{ inputs.source_release }}' \
+  'is not a source release tag'
+do
+  grep -Fq -- "$want" "$build_wf" || err "${build_wf}: no longer contains \`${want}\` -- push=true must require the default branch and a vMAJOR.MINOR.PATCH source release tag, so an image can never be published from untagged source"
+done
+if grep -Fq -- 'refs/tags/v[0-9]' "$build_wf"; then
+  err "${build_wf}: gates publishing on a tag ref again; releases dispatch from the default branch and the source tag is checked by content, not by github.ref (see MAINTAINING.md 'Publishing images')"
 fi
-# Trigger ownership. release.yml is the only workflow that may run on a tag push,
-# because a second tag listener would build the same 8-version chain twice from
-# one tag: their concurrency groups differ (build-and-verify-<ref> vs
+# The callee must be *told* what it is publishing: release.yml feeds the guard's
+# outputs to the matrix leg, and the PHP version comes out of the manifest.
+# shellcheck disable=SC2016
+for want in \
+  'source_release: ${{ needs.guard.outputs.release }}' \
+  'revision: ${{ needs.guard.outputs.revision }}' \
+  'version: ${{ matrix.series }}'
+do
+  grep -Fq -- "$want" "$release_wf" || err "${release_wf}: no longer passes \`${want}\` to the release matrix -- the scope, revision and source tag are one hand-off from guard to the build job"
+done
+# shellcheck disable=SC2016
+for want in \
+  's/^SOURCE_REF=' \
+  '"manifests/${series}.env"'
+do
+  grep -Fq -- "$want" "$release_wf" || err "${release_wf}: the matrix no longer reads the PHP version out of \`${want}\` -- the reviewed manifest, not a tag or an input, is what says which PHP version this release builds"
+done
+# Trigger ownership. release.yml is the only workflow that publishes, and it is
+# dispatch-only, so build-and-verify.yml must not grow a push trigger either: a
+# branch push that built and pushed would write the same floating tags outside the
+# guard's checks. Their concurrency groups differ (build-and-verify-<ref> vs
 # release-<ref>) so they cannot cancel each other, and both write the same
 # php-<version>-<variant>-<arch> layer-cache scopes. Nothing else here can catch
 # a re-added push trigger -- there is no actionlint step -- so it is asserted.
@@ -162,25 +215,90 @@ fi
 if ! grep -Eq '^  (pull_request|workflow_dispatch):' "$ci_wf"; then
   err "${ci_wf}: lost its pull_request/workflow_dispatch triggers"
 fi
-# One series per release run. Every release job must gate on the series guard
-# selected, and the series it gates on must be the version it builds -- a dropped
-# "if:" would quietly rebuild the whole chain from one tag again, and a gate that
-# names another series would never run at all. Compared as two sorted lists so
-# this stays one assertion instead of a hardcoded copy of the version table.
-gates="$(grep -o "if: needs.guard.outputs.series == '[0-9.]*'" "$release_wf" | sed "s/.*'\([0-9.]*\)'/\1/" | sort | tr '\n' ' ')"
-built="$(grep -o 'version: "[0-9.]*"' "$release_wf" | sed 's/.*"\([0-9.]*\)"/\1/' | sort | tr '\n' ' ')"
-if [ -z "${gates// /}" ] || [ "$gates" != "$built" ]; then
-  err "${release_wf}: the release jobs' series gates (${gates:-none}) do not match the versions they build (${built}) -- each release-* job needs if: needs.guard.outputs.series == '<version>'"
-fi
-for f in README.md MAINTAINING.md SUPPORTED.md SECURITY.md; do
-  if ! grep -Fq 'vX.Y.Z' "$f"; then
-    err "$f: does not document the vX.Y.Z release tag scheme"
-  fi
+# One entry point, one matrix. The release is a single job that calls the reusable
+# workflow once per selected series, so adding a PHP series costs a manifest and an
+# allowlist row rather than a new block of eight near-identical YAML. Assert the
+# matrix is fed by the plan job's JSON, that nothing publishes on its own terms
+# (push=true only where the matrix leg asks for it), and that the retired per-series
+# jobs have not come back -- eight static jobs would again mean eight places to
+# forget a fix.
+# shellcheck disable=SC2016
+for want in \
+  'include: ${{ fromJSON(needs.plan.outputs.matrix) }}' \
+  'uses: ./.github/workflows/build-version.yml' \
+  'fail-fast: false' \
+  'push: true'
+do
+  grep -Fq -- "$want" "$release_wf" || err "${release_wf}: no longer contains \`${want}\` -- the release is one dynamic matrix job that calls ${build_wf} for each series guard selected"
 done
+per_series_jobs="$(grep -c '^  release-[0-9_]*:' "$release_wf" || true)"
+if [ "$per_series_jobs" != 0 ]; then
+  err "${release_wf}: ${per_series_jobs} static per-series release job(s) are back; one matrix job selects the scope, so a new PHP series must not need a YAML edit"
+fi
+matrix_uses="$(grep -c 'uses: ./.github/workflows/build-version.yml' "$release_wf" || true)"
+if [ "$matrix_uses" != 1 ]; then
+  err "${release_wf}: ${matrix_uses} jobs call ${build_wf}, expected 1 (a second caller is a second release entry point, and they would race over the same floating tags)"
+fi
+# Guard emits the selection both run types need -- one series, or all of them --
+# and the plan job turns it into the matrix. A guard that stops writing it selects
+# nothing, and every job downstream reads as skipped while the run still looks
+# green.
+# These are literal lines of the workflow file, quoted as-is: nothing here is
+# meant to expand, which is why the patterns are single-quoted.
+# shellcheck disable=SC2016
+for want in \
+  'steps.dispatch.outputs.selected' \
+  'echo "selected=,$series," >> "$GITHUB_OUTPUT"' \
+  'if [ "$series" = "all" ]; then' \
+  'steps.srctag.outputs.release'
+do
+  grep -Fq -- "$want" "$release_wf" || err "${release_wf}: no longer contains \`${want}\` -- guard turns the dispatch input into the selected series list and the source release tag into the release output, and the matrix is built from both"
+done
+# An empty selection must be refused twice: validate's readiness step and the plan
+# job that would otherwise emit a zero-entry matrix. Without either, a guard that
+# emits only separators loops zero times, prints its success line for nothing, and
+# the run goes green with no image published.
+# shellcheck disable=SC2016
+empty_refusals="$(grep -cF -- '[ "$#" -gt 0 ]' "$release_wf" || true)"
+if [ "$empty_refusals" != 2 ]; then
+  err "${release_wf}: ${empty_refusals} empty-selection refusals, expected 2 (the 'Selected series are release-ready' step and the plan job) -- a run with nothing selected must fail, not finish green with no image published"
+fi
+# One Overview sync per run, and it is a job, not a leg. The Docker Hub Overview is
+# one document for the whole <user>/php repository, so a version=all run must write
+# it once: the mirror-readme job owns the call, and the per-series build job must
+# not make it at all -- with eight matrix legs, a call there is eight PATCHes of the
+# same page, and one green leg hides the other seven failures.
+sync_tool="tools/sync-dockerhub-readme.sh"
+overview_jobs="$(grep -c '^  mirror-readme:' "$release_wf" || true)"
+if [ "$overview_jobs" != 1 ]; then
+  err "${release_wf}: ${overview_jobs} mirror-readme jobs, expected exactly 1 (the Overview is one document per repository; a full release needs one owner for the call)"
+fi
+if ! grep -Fq "./${sync_tool}" "$release_wf"; then
+  err "${release_wf}: nothing calls ./${sync_tool}, so releases stop updating the mirror's Overview while the docs still say they do"
+fi
+if grep -Fq "./${sync_tool}" "$build_wf"; then
+  err "${build_wf}: a publish leg calls ./${sync_tool} again; the Overview belongs to release.yml's mirror-readme job, and every matrix leg writing it means one PATCH per series per variant"
+fi
+# What the documents have to say about the model, matched against a whitespace-
+# flattened copy of each file so a claim is not "missing" merely because the prose
+# wrapped across a line break. Four things each doc must still state:
+#   vX.Y.Z                    -- the shape of a source release tag
+#   source release tag        -- what a git tag is for (it selects nothing)
+#   8.1.34-r1                 -- an immutable image name, by example
+#   Exact tags are never moved -- why pinning one is safe
+# A doc that drops the second invites a maintainer to cut another tag for the second
+# build of that PHP version, which is the model this project retired: the tag marks
+# source, the input picks the scope, the manifest holds the version, and the image
+# name carries the revision. Dropping the last one invites a reader to pin an exact
+# name and wait for a fix that will never arrive under it.
+flat() { tr '\n' ' ' < "$1" | tr -s ' '; }
 for f in README.md MAINTAINING.md SUPPORTED.md SECURITY.md; do
-  if ! grep -Fiq 'one tag per PHP version' "$f"; then
-    err "$f: no longer states that a rebuild moves the existing tag (one tag per PHP version)"
-  fi
+  [ -f "$f" ] || { err "$f: missing"; continue; }
+  for want in 'vX.Y.Z' 'source release tag' '8.1.34-r1' 'Exact tags are never moved'; do
+    if ! flat "$f" | grep -Fq -- "$want"; then
+      err "$f: no longer states \`${want}\` -- see the release model in MAINTAINING.md ('Publishing images'): a git tag marks source (vX.Y.Z), the dispatch input picks the series or all, manifests/<series>.env holds the PHP version, and the image name carries the revision (-r<N>, and exact tags are never moved)"
+    fi
+  done
 done
 
 # Nothing in the repository may address an image as "php-legacy:" -- that was
@@ -197,11 +315,25 @@ stale_tag="$(grep -rl --exclude-dir=.git --exclude="$(basename "$0")" -e 'v\*-le
 if [ -n "$stale_tag" ]; then
   err "these files still reference the removed v*-legacy tag scheme: ${stale_tag}"
 fi
+# And for the retired image name: an exact name whose revision is a bare integer
+# (8.1.34-1-cli) was published by no release and is published by no release now --
+# a rebuild is 8.1.34-r2-cli. A document showing that shape tells someone to pull a
+# tag that does not exist, and a workflow composing it would overwrite the bare
+# 8.1.34-cli snapshot that is in the registry.
+old_rev='[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-(cli|fpm)'
+stale_rev="$(grep -rlE --exclude-dir=.git --exclude="$(basename "$0")" -e "$old_rev" . 2>/dev/null | sed 's|^\./||' | sort | tr '\n' ' ')"
+if [ -n "$stale_rev" ]; then
+  err "these files still use the retired <full>-<N>-<variant> image name (a revision is spelled -r<N>): ${stale_rev}"
+fi
 
-# The latest tag is gone: one release run publishes one PHP series, so a
-# "latest-<variant>" name resolved to whichever series someone tagged last --
+# The latest tag is gone: a release run publishes the series it selects -- one
+# series for a single-series dispatch, all of them for version=all -- so
+# a "latest-<variant>" name resolved to whichever series was released last --
 # neither the newest PHP nor a recommendation, and an unrelated rebuild of an
-# older series moved it backwards. <minor>-<variant> is the only floating name
+# older series moved it backwards. A full release would move every latest name at
+# once, which is the same silent-major-jump argument a single-series release cannot
+# escape.
+# <minor>-<variant> is the only floating name
 # the pipeline writes, and it cannot change major version. Assert both halves of
 # that: the publish step writes exactly the two tags, and no document advertises
 # a latest address. A pull of an advertised-but-unpublished name is the failure
@@ -211,9 +343,9 @@ if grep -Fq -- '-t ${repo}:latest' "$build_wf"; then
   err "${build_wf}: the publish step writes a latest tag again; there is no latest tag (see MAINTAINING.md 'Publishing images')"
 fi
 # shellcheck disable=SC2016
-tag_writes="$(grep -c -- '-t ${repo}:' "$build_wf")"
+tag_writes="$(grep -c -- '-t ${repo}:' "$build_wf" || true)"
 if [ "$tag_writes" != "2" ]; then
-  err "${build_wf}: the publish step writes ${tag_writes} tags, expected 2 (<full-php-version>-<variant> and <minor>-<variant>) -- a change here is a change to the published namespace and to the docs"
+  err "${build_wf}: the publish step writes ${tag_writes} tags, expected 2 (the immutable <full>-r<revision>-<variant> and the floating <minor>-<variant>) -- a change here is a change to the published namespace and to the docs"
 fi
 stale_latest="$(grep -rl --exclude-dir=.git --exclude="$(basename "$0")" 'php:latest' . 2>/dev/null | sed 's|^\./||' | sort | tr '\n' ' ')"
 if [ -n "$stale_latest" ]; then
@@ -231,21 +363,14 @@ done
 # The Docker Hub mirror's Overview is written by a tool in this repository, but the
 # promise a maintainer reads ("a release syncs it") is a promise about a workflow
 # step, and every way that rots is silent: drop the call and the page goes stale by
-# however many releases since with no failing job anywhere; drop the variant gate and
-# both merge legs PATCH the same repository so one green leg covers the other's
-# failure; give the manual workflow a push or pull_request trigger and a branch that
+# however many releases since with no failing job anywhere; put the call back in the
+# per-series build job and a version=all run PATCHes the same document once per leg;
+# give the manual workflow a push or pull_request trigger and a branch that
 # is not main can write the mirror's page with the mirror's secrets. Asserted here
 # for the same reason the trigger ownership above is: there is no actionlint step.
-sync_tool="tools/sync-dockerhub-readme.sh"
 sync_wf=".github/workflows/sync-dockerhub-readme.yml"
 [ -f "$sync_tool" ] || { err "$sync_tool not found (the Overview sync is documented, so it has to exist)"; }
 [ -f "$sync_wf" ] || err "$sync_wf not found (MAINTAINING.md documents a manual dispatch path for the Overview)"
-if [ -f "$build_wf" ] && ! grep -Fq "./$sync_tool" "$build_wf"; then
-  err "${build_wf}: no longer calls ${sync_tool}, so releases stop updating the mirror's Overview while the docs still say they do"
-fi
-if [ -f "$build_wf" ] && ! grep -Fq "matrix.variant == 'cli'" "$build_wf"; then
-  err "${build_wf}: the Overview sync lost its matrix.variant == 'cli' gate; both merge legs would write the same repository metadata from one release"
-fi
 if [ -f "$sync_wf" ]; then
   if grep -Eq '^  (push|pull_request|schedule):' "$sync_wf"; then
     err "${sync_wf}: has a trigger beyond workflow_dispatch; only a human on the default branch may write the mirror's Overview"
@@ -290,10 +415,11 @@ done
 if [ "$fail" = 0 ]; then
   printf 'Published image address: %s\n' "$published"
   printf 'Local build tag:         %s:<version>-<variant>-test (never pushed)\n' "$local_repo"
-  printf 'Release tag scheme:      refs/tags/v[0-9]* with shape exactly vX.Y.Z, one tag per version, trigger "%s"\n' "$tag_trigger"
-  printf 'Published tags:          %s:<full>-<variant> and %s:<minor>-<variant>; no latest tag\n' "$published" "$published"
-  printf 'Trigger ownership:       %s is tag-only; %s has no push trigger; %s is dispatch-only\n' "$release_wf" "$ci_wf" "$sync_wf"
-  printf 'Hub Overview sync:       %s, called by %s (cli leg) and %s; self-tested in both validate jobs\n' "$sync_tool" "$build_wf" "$sync_wf"
+  printf 'Source release tag:      vX.Y.Z (vMAJOR.MINOR.PATCH) marks the dispatched commit; it selects no series and carries no revision\n'
+  printf 'Release scope:           workflow_dispatch version=all or one series; PHP versions from manifests/<series>.env\n'
+  printf 'Published tags:          %s:<full>-r<revision>-<variant> (immutable) and %s:<minor>-<variant> (floating); no latest tag\n' "$published" "$published"
+  printf 'Trigger ownership:       %s is dispatch-only and the only release entry point; %s has no push trigger; %s is dispatch-only\n' "$release_wf" "$ci_wf" "$sync_wf"
+  printf 'Hub Overview sync:       %s, called once per release by %s (mirror-readme) and by %s for a README-only change; self-tested in both validate jobs\n' "$sync_tool" "$release_wf" "$sync_wf"
   printf 'Checked: %s, %s, build.sh, %s\n' "$build_wf" "$release_wf" "$(printf '%s' "$docs SECURITY.md" | tr '\n' ' ')"
 fi
 exit "$fail"

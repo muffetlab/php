@@ -2,7 +2,8 @@
 
 [README.md](README.md) is written for people who **pull** these images. This
 file is for the much smaller audience that builds or publishes them: filling
-manifests, reviewing patchsets, running the CI chain, cutting release tags, and
+manifests, reviewing patchsets, running the CI chain, cutting a source release tag
+and dispatching a release, and
 understanding why the gates are shaped the way they are.
 
 Nothing here changes an image. The published address, the tag scheme and the
@@ -482,7 +483,7 @@ base split; both newer bases ship OpenSSL 3.x, so the `openssl3` route spans the
 7.4/8.0/8.1 manifests moved to trixie on 2026-11-03; 7.4's trixie build was
 published on 2026-11-04, while 8.0 and 8.1 kept their bookworm tags until their
 next release runs. The registry keeps its own truth — the digest
-of a tag changes at publish time, and SUPPORTED.md's generated "Published tags"
+of a tag changes at publish time, and SUPPORTED.md's generated "Release tags"
 section reads the digests live, so a consumer anchoring on a digest cannot be
 surprised by this sentence going stale. (The per-series digest records that
 preceded this live-read mechanism lived in manifests/SECURITY-REVIEW.md and were
@@ -663,9 +664,9 @@ evidence. If the finding names PHP rather than a Debian package, it belongs in
 
 - `.github/workflows/build-and-verify.yml`: static `validate` gate (triggered by
   `pull_request` and manual dispatch only — it has no `push:` trigger, and
-  `tools/check-image-name.sh` asserts that, because a shared tag trigger would
-  run this test chain alongside release.yml's publishing chain and the two
-  concurrency groups cannot cancel each other)
+  `tools/check-image-name.sh` asserts that, because a branch push that ran this
+  chain beside release.yml's publishing run would build the same images under two
+  concurrency groups that cannot cancel each other and write the same layer caches)
   (shellcheck + `bash -n` over every `*.sh` in the repo, `sh -n`/`bash -n` over
   every Dockerfile `RUN` block, the verify-script stub harness,
   the OS-gate verdict stub harness (`tests/scan-image-harness.sh`),
@@ -716,13 +717,15 @@ evidence. If the finding names PHP rather than a Debian package, it belongs in
   only**, and a `merge` job assembles the two digests into the published
   multi-arch manifest list, so a failed leg leaves no single-arch tag behind
   (see below).
-- `.github/workflows/release.yml`: publishing pipeline, triggered by
-  release tags (`v*`, shape-checked to exactly `vX.Y.Z` and to a supported PHP
-  series in its guard
-  job) or manual dispatch **from the default branch only** (main
-  or master, both accepted), where the required `version` input names the series.
-  Either way the guard exports one PHP series and only that series' build job
-  runs. Re-runs the full
+- `.github/workflows/release.yml`: the only publishing workflow, and the only
+  release entry point. It is `workflow_dispatch`-only -- there is no tag push
+  trigger -- and runs only from the default branch (main or master, both accepted).
+  Its required `version` input picks the scope (one PHP series or `all`), its
+  required `revision` input is the image revision every published exact name
+  carries, and its guard job refuses a dispatched commit that carries no `vX.Y.Z`
+  source release tag. One run is one validate, one dynamic matrix with a build leg
+  per selected series, and one mirror Overview sync.
+  Re-runs the full
   validate gate, refuses empty releases, and pushes reviewed images.
 - Unfilled manifests cause the corresponding build to **skip**, not fail: the
   review gates stay human decisions — for the series a release did *not* select.
@@ -741,15 +744,50 @@ evidence. If the finding names PHP rather than a Debian package, it belongs in
 Registry defaults to GHCR and the published image is `ghcr.io/muffetlab/php`
 (the ref is `<registry>/<namespace>/php`, namespace input defaulting to
 `muffetlab`); a Docker Hub mirror is pushed automatically when
-`DOCKERHUB_USERNAME`/`DOCKERHUB_TOKEN` secrets exist. Tag scheme:
+`DOCKERHUB_USERNAME`/`DOCKERHUB_TOKEN` secrets exist.
+
+**Four things, four jobs.** Nothing in this pipeline has to do two jobs, because the
+coupling is what made a full release cost eight tags:
+
+| Question | Answered by |
+| --- | --- |
+| Which source is an official release? | a git tag on the dispatched commit: `vX.Y.Z` (say `v1.0.0`) |
+| Which PHP series does this run build? | the `version` input of the dispatch: `8.1`, or `all` |
+| Which PHP version is that series? | `SOURCE_REF` in `manifests/<series>.env` |
+| Which build of that version is this image? | the `revision` input, published as `-r<N>` |
+| What does a deployment pull? | Docker tags, below |
+
+A git tag therefore selects nothing, carries no revision, and appears in no image
+name -- which is what lets one tag cover a release of eight series, and what makes
+`v1.1.0` next to `v1.0.0` mean "a new source release" rather than "a different PHP
+version". Adding PHP 8.2 costs a manifest and a `SUPPORTED_VERSIONS` row; the
+release mechanism does not change.
+
+Tag scheme:
 
 | Tag | Meaning |
 | --- | --- |
-| `<minor>-<variant>` (e.g. `5.6-fpm`) | recommended deploy tag; moves only within its own series |
-| `<full-php-version>-<variant>` (e.g. `5.6.40-fpm`, `8.1.34-cli`) | fully-qualified exact tag, for when a deploy log must name what runs |
+| `<minor>-<variant>` (e.g. `8.1-fpm`) | recommended deploy tag; moves only within its own series, and every release run moves it to that run's build |
+| `<full-php-version>-r<revision>-<variant>` (e.g. `8.1.34-r1-cli`, `8.1.34-r2-fpm`) | fully-qualified immutable exact tag -- `r1` is the first image built from that PHP version, `r2` the next build of it |
 
-There is no `latest` tag, by design. A release run publishes **one** series, so a
-`latest-<variant>` tag would resolve to whichever series someone tagged last —
+An OS security fix, a refreshed base digest, or a newer backports commit that does
+not move `SOURCE_REF` bumps the revision and leaves the PHP version alone: `r1` ->
+`r2`. Exact tags are never moved, so a deployment that pins `8.1.34-r1-fpm` keeps
+that image until it moves on purpose; `<minor>-<variant>` is the name that carries a
+fix to a deployment without an edit. SUPPORTED.md's generated "Release tags"
+section names, per variant, the exact tag the registry currently serves behind
+the floating one -- which is the highest revision it has, read live.
+Re-dispatching the *same* revision does overwrite that one name; the guard asks a
+human for the number rather than deriving it from the registry exactly because two
+runs that each concluded "I am r1" would fight over it, so a fix ships as `r2`.
+
+Names published before the revision existed are bare (`8.1.34-cli`); they stay in
+the registry as the snapshots they are, are read as revision 0 by the generator, and
+are not rewritten.
+
+There is no `latest` tag, by design. A release run publishes the series its input
+selects, so a
+`latest-<variant>` tag would resolve to whichever series was released last —
 neither the newest PHP nor a recommendation — and a bare
 `docker pull <registry>/<namespace>/php` asks the registry for `latest`, the one
 name that cannot say which variant it is. `<minor>-<variant>` is the only floating
@@ -815,52 +853,115 @@ route per series (5.6 → `openssl11`, every other series → `openssl3`; both t
 `validate` and `build-and-verify` workflows reject a manifest that disagrees), so
 a `-openssl11` / `-openssl3` suffix could never express a deployment choice — it
 would only make the tag differ from the `php:<full>-<variant>` shape people are
-migrating off. The route stays in `/opt/php/BUILD-PROVENANCE`, the
-`dev.php-legacy.openssl-route` label and the SUPPORTED.md table. The cost is
-explicit: because a rebuild republishes the same names, a future route migration
-for the same PHP version would replace `5.6.40-fpm` with a different libssl
-rather than publishing a second tag. Deployments that care pin the digest.
+migrating off — and the suffix slot belongs to the image revision, the one number a
+reader can act on (`8.1.34-r2-fpm` is later than `8.1.34-r1-fpm`; `-openssl3` says
+nothing a manifest does not already say). The route stays in
+`/opt/php/BUILD-PROVENANCE`, the `dev.php-legacy.openssl-route` label and the
+SUPPORTED.md table. What the old scheme cost — a future route migration for the
+same PHP version replacing `8.1.34-fpm` with a different libssl build — is what the
+per-build revision removes: that migration is now `revision=2`, publishing
+`8.1.34-r2-fpm` beside the old snapshot instead of over it. The floating `8.1-fpm`
+still follows the newest build, so a route migration is still a reason to read the
+label rather than guess from a name, and deployments that must not move at all pin
+the digest.
 
 Release flow: fill each `BASE_IMAGE` digest (`tools/resolve-base-digest.sh`,
 committed by hand) → finish reviews and update
 `manifests/SECURITY-REVIEW.md`, and update `manifests/OS-CVE-STATUS.md` for anything
 reported against the Debian package closure (the base bump a rebuild takes, or a row
 with tracker evidence for what it cannot) → `./tools/gen-supported.sh` and commit →
-tag the PHP version you are publishing (`v8.1.34`) and push the tag. Every leg runs
+tag that commit as a source release (`git tag v1.0.0 && git push origin v1.0.0`) →
+dispatch `release.yml` from the default branch with `version` (one series or `all`)
+and `revision` (the image revision, `1` for the first build of what the manifests
+pin). The tag is a prerequisite, not a selector: it marks the source the images were
+built from, and the run refuses to publish without one. Every leg runs
 `tools/scan-image.sh` over the image it built before pushing anything, so a release
 cannot publish an OS finding that is neither fixed by the refresh nor registered.
 
-**One tag per PHP version:** rebuilding that version — new base digest, newer
-backports commit — moves the existing tag to the new commit and republishes the
-same `<full>-<variant>` tags over the previous ones
-(`git tag -f v8.1.34 && git push -f origin v8.1.34`); the guard job rejects
-suffixed tags such as `v8.1.34-2`, so the tag namespace cannot fork into
-parallel histories of the same PHP version. **One run publishes one series**: the
-tag's series is what gets built (`v5.6.40` rebuilds 5.6's `cli` and `fpm` on both
-architectures and nothing else), the other series keep their previous images —
-including their previous base digest, which only a tag for *that* series picks
-up. `build-version.yml` fails the merge if a tag names a different series than the
-build it is publishing — the check that used to guard `latest-<variant>` now
-guards `<minor>-<variant>`, and it still matters because a widened caller would
-repoint a floating name at an unreviewed rebuild of another series. A release can
-also be run manually from the default branch, with the series chosen by the
-required `version` input (a free string validated against the supported list, so
-the list is not duplicated as a `choice` menu); it writes the same `<full>-<variant>`
-and `<minor>-<variant>` names a tag run writes — there is no `latest` tag for the
-two paths to differ over.
-Because a run now publishes a single series, an unfilled or unapproved manifest
-**for that series fails the release** instead of being skipped — the validate job
-checks the selected series is release-ready, so a mistargeted tag cannot finish
-green with nothing published. Manifests for the *other* series are still allowed
+**What the tag means, and what it does not.** `vX.Y.Z` marks a source release of
+*this kit* — the commit whose manifests, reviews and patch trees are official. It
+does not name a PHP version, does not carry the image revision, and appears nowhere
+in an image name, which is why one tag covers a release of eight series and why the
+tag namespace stays an append-only history of source rather than a history of builds
+(that is the registry's `-r<N>` namespace, and SUPPORTED.md reads it live). Tags are
+never moved or deleted, and a run whose commit has no `vX.Y.Z` tag fails in the guard
+before any build starts — publishing is refused from untagged source at both ends:
+`release.yml` checks `git tag --points-at`, and `build-version.yml` refuses
+`push=true` unless `source_release` names such a tag.
+`v1.0.0-rc1` is not a release tag and never starts a publish: the guard's regex is
+`vMAJOR.MINOR.PATCH`, and a commit carrying only `v1.0` or no tag at all is refused
+the same way.
+The revision is the other half, and it is asked for, not derived: `revision` is a
+required, positive integer, and every published exact name carries it. Two runs that
+each concluded "I am r1" would fight over one published name, so the number is the
+human's decision — and because the name always has one, the old failure mode where a
+rebuild with no number republished the bare name over the snapshot it was supposed to
+protect is gone by construction. The number is shared by every series in the run,
+which is what makes `r2` a release of *this kit* rather than of one PHP version:
+`5.6.40-r2-cli` and `8.1.34-r2-cli` are different PHP versions and the same second
+build.
+Two builds of one series must not overlap either: the concurrency group is per ref,
+so a second dispatch started while the first is running queues behind it rather than
+building twice — but two dispatches naming the same revision still resolve to the
+same published names, so wait for the first run to finish before cutting `r2`.
+**A run publishes the series its input
+selects**: `version=5.6` rebuilds 5.6's `cli` and `fpm` on both
+architectures and nothing else, and the series a run does not select keep their
+previous images — including their previous base digest, which only a release of
+*that* series picks up. The PHP version each selected series builds comes from
+`SOURCE_REF` in its manifest and is carried into the matrix, so nothing between the
+input and the image name is allowed to restate it. A release can
+be run for one PHP series (a free string validated against the supported list, so
+the list is not duplicated as a `choice` menu) or for `all` of them, and both paths
+write the same exact and `<minor>-<variant>`
+names — there is no `latest` tag for the two paths to differ over.
+
+**Why a full release is one run and not eight.** A full release is one
+`version=all` dispatch, and it is not a matter of convenience: eight dispatches would
+each be a separate run of the same commit, and the reason that is worse than merely
+wasteful is the
+`SUPPORTED.md up to date` gate in `validate`, which reads the *live* registry:
+inside one run every build job starts after a single read that still describes the
+state the release departs from. Eight runs cannot make that claim: a run whose
+`validate` starts after another series has already published reads digests that run
+did not write, and fails a documentation check because some other release succeeded.
+That is also why
+the legs of an `all` run are siblings in one matrix rather than a chain — they
+share no name to race over (`5.6-cli` … `8.1-cli` are eight different floating
+names) and one series' build failure must not withhold the fixes its seven healthy
+siblings published; `fail-fast: false` is what says that out loud in the workflow.
+The one Overview call per run follows the same reasoning:
+`<user>/php` has a single README, so it is not a build-job step at all — `release.yml`
+has a `mirror-readme` job that runs once after the matrix, and the per-series
+`build-version.yml` leg publishes images and nothing else.
+After any release that moved a digest, `SUPPORTED.md` is stale by construction:
+the run that published wrote new digests into the registry, while the committed
+file recorded the ones before it. Regenerate and commit it
+(`./tools/gen-supported.sh`) before the next release or the `SUPPORTED.md up to
+date` gate in `validate` fails — a full release makes that bookkeeping one pass
+instead of eight, because one run moves every digest and one regeneration
+describes all of them. The gate compares the committed file against
+generator output read from the *live* registry, and it runs on a runner because
+the registry has to be reachable to answer; a registry outage therefore blocks a
+release rather than publishing beside a document that cannot say what it verified.
+Because a run publishes only the series it selects, an unfilled or unapproved
+manifest **for a selected series fails the whole release** instead of being
+skipped — the validate job checks every selected manifest is release-ready, so a
+mistargeted tag cannot finish green with nothing published, and an `all` run that
+found one unreviewed series pushes nothing at all. The same step also refuses a
+selection that names no series once it is split: an empty list would otherwise
+loop zero times, print "release-ready", and leave every build job to skip itself.
+Manifests for the *unselected* series are still allowed
 to be unreviewed, and `build-version.yml` still refuses to build one it is handed.
 Every published image
 embeds `/opt/php/BUILD-PROVENANCE` and OCI labels (base digest, source
 repo/ref/commit, route, build package list, PECL pins, Composer version + phar
 digest, patch digests, and — via `/opt/php/BUILD-CLEANUP` — whether the source
 tree was shipped and what it weighed before and after trimming), with
-provenance/SBOM attestations attached where the registry supports them — and on a
-tag run they are always requested, because `inputs` is empty for a push event and
-each release job passes `github.event_name == 'push' || inputs.attestations`.
+provenance/SBOM attestations attached where the registry supports them — and the
+dispatch checkbox is the whole decision, because there is no other way to start a
+release: `attestations` defaults to `true` and `release.yml` passes the value to
+every matrix leg.
 Asking for them costs a build-time dependency: buildx generates the SBOM with
 `docker.io/docker/buildkit-syft-scanner:stable-1`, which the leg pulls from Docker
 Hub while it builds (observed locally as the exact reference it resolves before
@@ -967,10 +1068,13 @@ first non-ASCII byte, because a JSON encoder is free to send the en dash in this
 repository's title as an escape and a byte-for-byte grep would then report a
 successful write as a failure.
 
-**Where it runs.** The release path is the last step of `build-version.yml`'s merge
-job, on the `cli` leg only — both legs publish images, but the Overview is one piece
-of metadata for the whole repository, and two legs PATCHing the identical body means
-one can fail while the other's green run reads as "synced". It is
+**Where it runs.** The release path is `release.yml`'s `mirror-readme` job: one job,
+after the matrix, one call. It is deliberately not a step in `build-version.yml`,
+where it used to sit on the `cli` leg of each merge job — the Overview is one piece of
+metadata for the whole `<user>/php` repository, and a `version=all` run starts eight
+matrix legs, so a step there means eight PATCHes of an identical body with one green
+leg covering seven failures. As a job of its own it also says what it covers: the
+release published, then the page was synced. It is
 `continue-on-error`, for the reason every tail step here has: the tags and layers are
 already published, and a red job at the end of a good release invites someone to
 re-run it, which repushes image tags to fix a documentation pane. The message says
@@ -1034,5 +1138,5 @@ placeholders, non-digest base images, and unpinned commits.
 - `SUPPORTED.md`: generated support/pin/review matrix — start here as a consumer
 - `.github/workflows/`: CI validate gate + sequential build chain + release pipeline
 - `docker-compose.example.yml`: internal FPM + Nginx network example. The app is mounted at `./app:/var/www/html:ro` on **both** the nginx service and every FPM service, and that is not decoration: nginx sends `SCRIPT_FILENAME` as a path string and php-fpm opens it in its own container, so a different path on each side yields "Primary script unknown"
-- `nginx.conf.example`: matching Nginx site config — FastCGI to one compose service (`php56:9000`), `try_files $uri =404` for the PHP location, dotfiles denied; copy it per version you expose. `$document_root` is nginx's per-request `root`/`alias` value, not a host variable, so it works in containers as long as the two mounts agree
+- `nginx.conf.example`: matching Nginx site config — FastCGI to one compose service (`php81:9000`), `try_files $uri =404` for the PHP location, dotfiles denied; copy it per version you expose. `$document_root` is nginx's per-request `root`/`alias` value, not a host variable, so it works in containers as long as the two mounts agree
 - `LICENSE` / `DISCLAIMER.md` / `SECURITY.md`: licensing, responsibility boundary, and vulnerability reporting

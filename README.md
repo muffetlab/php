@@ -9,7 +9,7 @@ that tells you what is actually available: it shows, per version, what is
 pinned, what base image it runs on, and how far the review has got.
 
 This file is the consumer's view. The build framework behind the images —
-manifests, patch review, CI chain, release tags — is documented in
+manifests, patch review, CI chain, the release model — is documented in
 [MAINTAINING.md](MAINTAINING.md), and you do not need any of it to pull and run
 an image.
 
@@ -24,23 +24,26 @@ namespace):
 > [manifests/SECURITY-REVIEW.md](manifests/SECURITY-REVIEW.md), so no document
 > here asserts it by hand. Each existing tag is one multi-arch manifest list
 > covering `linux/amd64` and `linux/arm64`, with a SLSA provenance statement and
-> an SPDX SBOM attached per platform. A release run names one series and
-> publishes its exact and floating tags; the pipeline publishes no latest tag of
+> an SPDX SBOM attached per platform. A release run publishes the series it
+> selects — one series for a single-series dispatch, every supported
+> series at once for a `version=all` dispatch — and writes each of their exact and
+> floating tags; the pipeline publishes no latest tag of
 > any shape and fails closed at the merge if a leg did not push, so a
 > half-published release cannot leave a name behind. See *Before you pull one*
 > below.
 
 ```
-ghcr.io/muffetlab/php:5.6-fpm             # minor tag: the recommended deploy tag
-ghcr.io/muffetlab/php:5.6.40-fpm          # exact PHP version + variant, for when a log must name what runs
+ghcr.io/muffetlab/php:8.1-fpm             # minor tag: the recommended deploy tag
+ghcr.io/muffetlab/php:8.1.34-r1-fpm       # exact PHP version + image revision + variant, for when a log must name what runs
 ```
 
 There is no `latest` tag at all, for any variant. A bare `docker pull` of the
 published image asks the registry for a `latest` and gets "manifest unknown", and
-that is a decision rather than a missing convenience: a release run — a push of an
-exact `vX.Y.Z` tag, or a manual dispatch naming one PHP series — publishes **one**
-series, so a `latest` name would resolve to whichever series was tagged last —
-pushing `v7.4.33` after a `v8.1.34` release would move it from 8.1
+that is a decision rather than a missing convenience: a release run — a manual
+dispatch naming one PHP series or `all` of
+them — publishes the series it selected, so a `latest` name would resolve to
+whichever series was released last —
+releasing 7.4 after an 8.1 release would move it from 8.1
 back to 7.4. That records the release order, not the code, and it is exactly the
 silent major-version jump a legacy application must not inherit from a base image.
 It could not even name the variant it meant: the one shape that makes a bare pull
@@ -57,19 +60,32 @@ without a `--platform` flag and without architecture-suffixed tag names.
 # A series is pullable from its first release run on, and SUPPORTED.md's
 # generated "Release tags" section always names the exact tags that exist.
 # This example's tag was written by an actual release run and stays valid.
-FROM ghcr.io/muffetlab/php:7.4-fpm
+FROM ghcr.io/muffetlab/php:8.1-fpm
 COPY ./my-app /var/www/html
 ```
 
 Recommended: deploy the minor tag, `X.Y-<variant>`. It cannot change major
-version, and a rebuild of its series republishes it, so the next security
-patch reaches every pull without a release cut on your side. The exact
-`X.Y.Z-<variant>` tag exists for when a deploy log must name the PHP version;
-the digest is the only name that binds to an exact manifest.
-One tag per PHP version exists, so a rebuild of `v8.1.34` republishes the
-same `8.1.34-fpm` tags instead of minting a new one — and a release run
-rebuilds only the series its tag names, so `v5.6.40` does not refresh
-`8.1.34-cli`; each series moves when its own tag is pushed. Tags do not name
+version, and every release run moves it to that run's build, so the next security
+patch reaches every pull without a release cut on your side.
+There is one image name per build, and Exact tags are never moved: the first
+release of PHP 8.1.34 publishes `8.1.34-r1-fpm`, and the fix on top of it — an OS
+refresh that leaves the PHP pin alone, or a newer backports commit — publishes
+`8.1.34-r2-fpm` *beside* it. The number is the image revision, set by whoever
+dispatches the release. It is not in a git tag: a `vX.Y.Z` tag such as `v1.0.0` is
+a source release tag, marking the commit a release was cut from, and it names
+neither a PHP version nor a build — which is why one tag covers a release of eight
+series, and why a run that dispatches from a commit with no source release tag
+simply fails.
+The consequence for a deployer is the flip side of that: pinning `8.1.34-r1-fpm`
+pins one build forever, so receiving a fix means moving to the newer revision —
+or to `X.Y-<variant>`, which is why it is the recommended one. SUPPORTED.md's
+generated "Release tags" section names the exact tag currently behind each
+floating name, read from the registry.
+The digest still beats both: it is the only handle that binds to a manifest by
+content rather than by name.
+A release run rebuilds only the series it selects, so a release of the 5.6 series does
+not refresh `8.1-cli`; each series moves when its own scope is dispatched, and the one
+run that moves all eight at once is a `version=all` dispatch. Tags do not name
 the OpenSSL route, because the
 pipeline fixes one route per series (see below); to know what you are actually
 running, read it out of the image:
@@ -140,8 +156,8 @@ Every image is built for exactly one OpenSSL major, and the build fails if the
 base image's OpenSSL major does not match the route its manifest declares — base
 system and OpenSSL have to agree per version, so the route is fixed by the series
 rather than chosen per deployment. Because there is no choice to express, the
-route is not part of a tag name: `5.6.40-fpm` is the openssl11 build and
-`8.1.34-fpm` is an openssl3 build. Where the route *is* recorded is
+route is not part of a tag name: `5.6.40-r1-fpm` is the openssl11 build and
+`8.1.34-r1-fpm` is an openssl3 build. Where the route *is* recorded is
 `/opt/php/BUILD-PROVENANCE`, the `dev.php-legacy.openssl-route` OCI label, the
 table below, and the image's own `verify-runtime`.
 
@@ -397,4 +413,4 @@ certificate and a second `server` block.
 - [SECURITY.md](SECURITY.md) — what "supported" means here, how to report a vulnerability, which gates CI enforces
 - [manifests/OS-CVE-STATUS.md](manifests/OS-CVE-STATUS.md) — the Debian side of the same question: every OS-package CVE reported against these images, what the image actually contains, and what the tracker says about a fix for the suite it is built on. Where the honest answer is "newer than this Debian release", the file says so and names the base bump as a decision not taken; trialling one is a CI dispatch, not a pin edit (see [MAINTAINING.md](MAINTAINING.md))
 - [DISCLAIMER.md](DISCLAIMER.md) — the responsibility boundary
-- [MAINTAINING.md](MAINTAINING.md) — build it yourself, review a patchset, cut a release tag, CI chain, repository layout
+- [MAINTAINING.md](MAINTAINING.md) — build it yourself, review a patchset, cut a source release tag and dispatch a release, CI chain, repository layout

@@ -41,7 +41,18 @@ private channel if the fix is not yet public. The expected maintainer flow:
    status table) and add any patch under `patches/<version>/` with a
    `REVIEW-*.md` record.
 3. Re-pin, rebuild, re-run `tests/`, regenerate `SUPPORTED.md`, and publish a
-   new immutable tag through the release workflow.
+   new immutable image through the release workflow at the next image revision —
+   `8.1.34-r2-fpm` beside the `8.1.34-r1-fpm` that is already published. The PHP
+   version does not change for an OS or patchset fix; the revision does. Exact tags
+   are never moved, so the previous build keeps its own name and digest in the
+   registry until someone publishes that exact name again — re-dispatching the same
+   revision does overwrite it, which is why a fix ships as `r2` rather than as a
+   second `r1`. The floating `8.1-fpm` moves to the fixed build — which is how someone who
+   pinned the minor tag gets the fix without editing anything, and why someone who
+   pinned `8.1.34-r1-fpm` has to move to `8.1.34-r2-fpm`.
+   The git tag is not part of this: `v1.0.0`-style tags mark source releases, and a
+   source release tag must exist on the commit the run dispatches from, but it does
+   not name the PHP version or the revision.
 
 ## OS package CVEs (the Debian base)
 
@@ -170,27 +181,37 @@ in the pinned commit.
   fails CI in both directions, so per-version divergence cannot accumulate
   undocumented — which matters because "backport coverage does not transfer
   between minor versions".
-- Pushes to registries are only possible from `main`/`master` (manual dispatch,
-  with the PHP series named by the required `version` input) or from a release
-  tag, and only through `release.yml`: it is the sole caller
-  that passes `push=true` to the reusable build job. Each run publishes exactly
-  one series — the one the tag or the input names — and its validate job fails the
-  run if that series' manifest is not pinned and approved, so a mistargeted tag
-  cannot end as a green release that published nothing. `build-and-verify.yml` runs
+- Pushes to registries are only possible from `main`/`master`, only through
+  `release.yml`, and only from a manual dispatch: it is the sole caller
+  that passes `push=true` to the reusable build job. The required `version` input
+  names the PHP series, or `all` for every supported series at once, and the
+  required `revision` input is the image revision every published exact name
+  carries. Each run publishes exactly the series it selects — the one the input
+  names, or all eight for an
+  `all` dispatch — and its validate job fails the
+  run if a selected series' manifest is not pinned and approved, so a mistargeted
+  release cannot end as a green run that published nothing, and a full release with
+  one unreviewed series pushes nothing at all. `build-and-verify.yml` runs
   on `pull_request` and manual dispatch, never on a push, and always calls that
-  job in test mode — so no PR, fork or branch push can reach a registry login,
-  and one tag starts exactly one chain. The tag trigger is `v*`, and the release
-  workflow's
-  guard job then requires exactly `vX.Y.Z` — one tag per PHP version, a rebuild
-  moves that tag instead of adding `vX.Y.Z-<rev>` — *and* that the named PHP
-  series is in the supported list, so a mistyped, unrelated or suffixed tag stops
-  before any image is built or pushed. The pipeline publishes no `latest` tag at
-  all — the two names a run writes are `<full-php-version>-<variant>` and
-  `<minor>-<variant>` — so no tag shape can move a `latest` for a series you did
+  job in test mode — so no PR, fork or branch push can reach a registry login.
+- Publishing also requires tagged source. `release.yml` checks out the full tag
+  history and its guard refuses a dispatched commit that carries no `vX.Y.Z` source
+  release tag; the callee independently refuses `push=true` unless `source_release`
+  names one, and it only publishes from `main`/`master` — never from a tag ref.
+  A git tag marks source and nothing else: it selects no PHP version (that is the
+  dispatch input and the manifest's `SOURCE_REF`), carries no image revision, and
+  appears in no image name, so one tag covers a release of eight series and there is
+  no tag shape that can be mistyped into building the wrong one. Release tags are
+  never moved or deleted, and the registry's `-r<N>` namespace is the append-only
+  history of builds. The pipeline publishes no `latest` tag at
+  all — the two names a run writes are the immutable
+  `<full-php-version>-r<revision>-<variant>` and
+  `<minor>-<variant>` — so no input or tag can move a `latest` for a series you did
   not release.
 - The Docker Hub mirror secret is used for more than a registry login now.
   `DOCKERHUB_TOKEN` must be a read+write personal access token, because
-  `tools/sync-dockerhub-readme.sh` (run by the release's merge job and by
+  `tools/sync-dockerhub-readme.sh` (once per release, by `release.yml`'s
+  `mirror-readme` job, and by
   `sync-dockerhub-readme.yml`) PATCHes the mirror repository's `full_description`
   so its Overview matches README.md. The blast radius of that wider scope is
   bounded the same way the rest of the pipeline is: the write happens only in a job

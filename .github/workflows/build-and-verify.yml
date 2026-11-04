@@ -20,10 +20,11 @@ name: build-and-verify
 # - Manual dispatch with trial_version + trial_base builds ONE series on a
 #   candidate Debian base instead of running the chain: see the trial jobs below.
 # - Triggers: pull_request and manual dispatch only. This workflow never runs on
-#   a push, because release.yml owns tag pushes and builds the same chain with
-#   push=true. Their concurrency groups differ (build-and-verify-<ref> vs
+#   a push, because release.yml is the only workflow that publishes and a branch
+#   push here would build the same chain beside a release run. Their concurrency
+#   groups differ (build-and-verify-<ref> vs
 #   release-<ref>), so a shared trigger could not cancel one against the other:
-#   one tag would run two full 8-version chains at once, racing the same GHA
+#   one push would run two full 8-version chains at once, racing the same GHA
 #   layer-cache scopes (php-<version>-<variant>-<arch>). tools/check-image-name.sh
 #   asserts this absence -- do not add a push: trigger back here.
 #   The known cost is that a direct push to master is no longer verified in CI,

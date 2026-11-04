@@ -7,77 +7,123 @@ name: release
 # name "php"). The namespace is the GHCR owner, so a fork overrides it with its
 # own GitHub user/org.
 #
-# Triggers:
-#   - push of a release tag:  vX.Y.Z  (one tag per PHP version; the guard job
-#     below is what enforces the shape)
-#     The tag names the PHP version, and exactly one tag exists per version:
-#     rebuilding it (new base digest, newer backports commit) moves the same
-#     tag to the new commit and republishes the same image tags rather than
-#     inventing v8.1.34-2. The tag's series is also what gets built: v5.6.40
-#     rebuilds 5.6's variants only.
-#   - workflow_dispatch from the default branch (main or master), publishing the
-#     series named by the required version input. It writes the same names a tag
-#     run writes: <minor>-<variant> plus the <full>-<variant> tag read from the
-#     image it built. Neither path writes a latest tag -- see below.
+# Four roles, kept deliberately apart -- this is the whole release model, and it
+# is what lets a new PHP series join without touching the pipeline:
+#   - A git tag marks a SOURCE RELEASE: vMAJOR.MINOR.PATCH (v1.0.0). It selects
+#     no PHP version, carries no build number, and contributes nothing to an image
+#     name. Its one job is to answer "which commit of this repository is official
+#     source", and this workflow requires the commit it publishes from to carry
+#     one -- see the guard job.
+#   - This Actions workflow input chooses the SCOPE: version is one PHP series
+#     (8.1) or all (every supported series, in this one run), and revision is the
+#     image revision (r1, r2, ...). There is exactly one release entry point and
+#     one release workflow; adding PHP 8.2, 8.3 or a dozen legacy lines adds a
+#     manifest, not a workflow.
+#   - manifests/<series>.env holds the PHP VERSION itself (SOURCE_REF, e.g.
+#     8.1.34) together with the base-image and php-src pins. The published exact
+#     name is composed from the version the image was actually built at, never
+#     from a tag name.
+#   - Docker tags express the RESULT: php:<minor>-<variant> (8.1-fpm) floats to
+#     the newest build of that series, and php:<full>-r<revision>-<variant>
+#     (8.1.34-r1-fpm) is an immutable snapshot of one build.
+#
+# Trigger: workflow_dispatch from the default branch (main or master) and nothing
+# else. A tag push cannot carry a scope, so publishing has one entry point -- the
+# dispatch below -- and pushing a tag starts no build. Because every publishing run
+# is a dispatch on the branch ref, the concurrency group below makes two releases
+# queue instead of racing, whatever series each names.
+#
+# What a run publishes: the exact <full>-r<revision>-<variant> name composed from
+# the PHP version the image reports, plus the floating <minor>-<variant> name. An
+# OS security update that does not move the PHP pin bumps the revision (r1 -> r2)
+# and publishes beside the old snapshot rather than over it. Nothing here counts
+# builds by asking the registry, and no run writes a latest tag -- see below.
 #
 # Safety model:
-#   - No :latest-<variant>, and no plain :latest either. Because one run
-#     publishes one series, "latest" would resolve to whichever series was
-#     released last -- not the newest PHP, not a recommendation, and it could
-#     move 8.1 -> 7.4 on an unrelated rebuild. <minor>-<variant> is the only
-#     floating name, and it cannot change the major version.
+#   - No :latest-<variant>, and no plain :latest either. A run publishes the series
+#     it selects, so "latest" would resolve to whichever series was released last
+#     -- not the newest PHP, not a recommendation, and it could move 8.1 -> 7.4 on
+#     an unrelated rebuild. <minor>-<variant> is the only floating name, and it
+#     cannot change the major version.
 #   - Re-runs the same static validate gate as CI (manifest policy + patch
 #     SHA-256 vs review records).
-#   - The selected version's manifest must itself be release-ready: validate
-#     refuses a run whose series is unfilled or not PATCHSET_APPROVED=1 rather
-#     than finishing green with nothing published. build-version.yml still skips
-#     any manifest that is unfilled or unapproved, so a release only publishes
-#     what humans have reviewed; it never lowers a gate.
+#   - Every selected version's manifest must itself be release-ready: validate
+#     refuses a run whose selected series is unfilled or not PATCHSET_APPROVED=1,
+#     and refuses a run that selected nothing, rather than finishing green with
+#     nothing published. build-version.yml still skips any manifest that is
+#     unfilled or unapproved, so a release only publishes what humans have
+#     reviewed; it never lowers a gate.
 #   - build-version.yml builds and tests each variant natively on linux/amd64
 #     and linux/arm64, pushes the per-arch images by digest, and merges them into
 #     one multi-arch manifest list per tag, so every published name resolves on
 #     both architectures.
-#   - build-version.yml independently refuses push unless github.ref is a
-#     branch it accepts (main or master) or a tag whose name starts with a
-#     version, and only release.yml's guard job lets a correctly shaped
-#     vX.Y.Z tag reach the build jobs at all.
-#   - One run publishes one series -- the series the tag names, or the series
-#     the version input names. The other series stay on their previous build,
-#     including their base digest, until each is tagged in turn. The old
-#     5.6 -> 7.x -> 8.x chain is gone here because a run can no longer select
-#     more than one build job; build-and-verify.yml keeps the chain, since a PR
-#     still has to test all eight.
+#   - build-version.yml independently refuses push unless github.ref is the branch
+#     it accepts (main or master) *and* source_release names a tagged source
+#     release (vMAJOR.MINOR.PATCH), and only release.yml passes push=true -- so
+#     the requirement that published images come from tagged source is enforced
+#     both where the scope is chosen and where the registry is written.
+#   - A run publishes the series it selects: one series for a version=8.1 dispatch,
+#     every supported series for version=all, in one run, as one dynamic matrix of
+#     build jobs. The series a run does not select stay on their previous build,
+#     including their previous base digest, until a later run selects them. Doing
+#     a full release in one run is also what makes the SUPPORTED.md gate honest:
+#     it reads the live registry once, in validate, before any of the matrix legs
+#     can push, so the check describes the state the release departs from.
+#   - One Docker Hub Overview sync per run, from the mirror-readme job, because the
+#     Overview is one piece of metadata for the whole <user>/php repository: eight
+#     matrix legs would otherwise PATCH the same document eight times and report one
+#     release as eight.
 
 on:
-  push:
-    tags:
-      # Bare "v*" is what a release tag looks like now (v8.1.34); the shape and
-      # the version series are enforced in the guard job below, because a glob
-      # cannot express either and this workflow pushes images.
-      - "v*"
+  # Dispatch only, and only from the default branch (the guard job below enforces
+  # that, because workflow_dispatch has no branch filter). A git tag push cannot
+  # carry the scope inputs, so tags mark source releases and start no build.
   workflow_dispatch:
     inputs:
       version:
-        description: "PHP series to release (one series per run; validated against the supported list)"
+        # One PHP series (8.1) or the literal all (every supported series, in this
+        # one run). A free string rather than a `choice` menu on purpose: a menu
+        # would repeat SUPPORTED_VERSIONS here and drift from it, and adding PHP 8.2
+        # should cost a manifest, not an edit to the release pipeline.
+        description: "PHP series to release (e.g. 8.1), or all for every supported series"
         type: string
         required: true
         default: "8.1"
+      revision:
+        # The image revision, written into the immutable name as -r<N>: that is
+        # 8.1.34-r1-fpm, and the next fix on the same PHP pin is 8.1.34-r2-fpm
+        # published beside it. Asked for rather than derived from the registry,
+        # because two runs each concluding "I am r1" would fight over one published
+        # name. Required and always positive: every exact name carries a revision,
+        # so there is no bare <full>-<variant> name for a rebuild to overwrite. One
+        # number per run, shared by every series an all-run publishes, which is what
+        # makes r2 a single release of this kit rather than eight unrelated builds.
+        description: "Image revision number (1 = first build of the PHP version in the manifests, 2 = the next fix; applies to every series in this run)"
+        type: string
+        required: true
+        default: "1"
       namespace:
         description: "GHCR owner/namespace that hosts the php image (default: muffetlab)"
         type: string
         default: "muffetlab"
       attestations:
-        # The `inputs` context is empty for a tag push, so a bare
-        # `${{ inputs.attestations }}` would hand the callee an empty value for a
-        # boolean input on exactly the run type that publishes images. Each
-        # release job therefore passes
-        # `github.event_name == 'push' || inputs.attestations`: a tag run always
-        # attests, a dispatch run honours the checkbox (including opting out).
+        # With no tag-triggered path left, the checkbox is the whole decision: a
+        # dispatch that unchecks it gets no attestations, and the release job passes
+        # the value through to every matrix leg.
         description: "Attach provenance/SBOM attestations"
         type: boolean
         default: true
 
 concurrency:
+  # Every publishing run is a dispatch on the default branch, so they all land in
+  # one group and queue instead of racing -- which covers the case the old
+  # tag-per-series model could not: a version=all run and a single-series dispatch
+  # can both move the same <minor>-<variant> name, and on separate refs nothing
+  # would have stopped them. Releases of different series therefore queue behind
+  # each other too; that is the cheap price of never having two runs fight over one
+  # floating name.
+  # cancel-in-progress stays false: a release cancelled mid-publish leaves some
+  # tags written and some not, and a queued release is the better failure.
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
@@ -89,30 +135,113 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
-      # The one PHP series this run publishes: the series a vX.Y.Z tag names, or
-      # the series the dispatch input names. Every release-* job gates on it, so
-      # a tag rebuilds that version's variants and architectures only.
-      series: ${{ steps.tag.outputs.series || steps.dispatch.outputs.series }}
+      # The source release being published -- the git tag that points at the commit
+      # this run is dispatching from (vMAJOR.MINOR.PATCH). A git tag marks source; it
+      # selects no PHP version, carries no image revision, and appears nowhere in a
+      # published name. It is here because publishing from untagged source is refused,
+      # so every image in the registry answers "which reviewed commit is this".
+      release: ${{ steps.srctag.outputs.release }}
+      # The PHP series this run publishes, as the comma-padded list the release matrix
+      # is built from: ",8.1," for version=8.1, and ",5.6,7.0,...,8.1," for version=all.
+      # Padded on both sides so one series can never match inside another the way a
+      # bare substring search would -- ",8.1," is not inside ",8.10,". Empty selects
+      # nothing, and the readiness step below treats that as a failure instead of
+      # letting the run go green with an empty matrix.
+      selected: ${{ steps.dispatch.outputs.selected }}
+      # The image revision every published exact name carries: php:<full>-r<N>-<variant>.
+      revision: ${{ steps.dispatch.outputs.revision }}
     steps:
-      - name: Dispatch allowed only from the default branch
-        if: github.event_name == 'workflow_dispatch' && !(github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+      - name: Release allowed only from the default branch
+        # Not just a branch rule any more: with no tag-push path, a run that was not
+        # dispatched from the default branch has no business holding registry
+        # credentials whatever its ref looks like.
+        if: github.event_name != 'workflow_dispatch' || !(github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
         run: |
-          echo "::error::manual release is only allowed from main or master"
+          echo "::error::release runs only from a workflow_dispatch on main or master (a git tag marks source and publishes nothing by itself)"
           exit 1
+
+      - uses: actions/checkout@v7
+        with:
+          # Every tag and every commit, because the step below asks whether *this
+          # commit* carries a source release tag. A shallow branch checkout has the
+          # commit but not the tag refs that point at it, and that would make a
+          # correctly tagged release look untagged.
+          fetch-depth: 0
+
+      - name: Source release tag check
+        id: srctag
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          set -eu
+          # A git tag marks a source release. It does not name a PHP version, does not
+          # carry the image revision, and contributes nothing to an image name -- which
+          # is exactly why one tag can cover a release of eight series: the scope came
+          # from the workflow input, and the tag is left alone to do the one thing it
+          # is good at, recording which commit of this repository is official source.
+          # Tags are still never moved, so the namespace stays an append-only history
+          # of source releases. What it no longer claims to be is a history of builds:
+          # that is the registry's -r<N> namespace, and SUPPORTED.md reads it live.
+          # grep with no match would end the step on its exit status, so || true keeps
+          # the empty answer on the path that prints the real message.
+          tags="$(git tag --points-at "$SHA" | { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; } | sort -V)"
+          if [ -z "$tags" ]; then
+            echo "::error::commit $(printf '%.10s' "$SHA") carries no source release tag (expected vMAJOR.MINOR.PATCH, e.g. git tag v1.0.0 && git push origin v1.0.0); refusing to publish an image whose source is not a tagged release"
+            exit 1
+          fi
+          count="$(printf '%s\n' "$tags" | wc -l | tr -d ' ')"
+          # Two release tags on one commit is legal but ambiguous. Publish under the
+          # highest rather than whichever git happens to list first, and say so -- the
+          # commit is the same either way, so this changes only the label.
+          release="$(printf '%s\n' "$tags" | tail -1)"
+          if [ "$count" != 1 ]; then
+            echo "Notice: ${count} source release tags point at this commit ($(printf '%s\n' "$tags" | tr '\n' ' ')); publishing under ${release}"
+          fi
+          echo "Publishing source release ${release} at commit $(printf '%.10s' "$SHA"), on $(git log -1 --format=%s)"
+          echo "release=${release}" >> "$GITHUB_OUTPUT"
+
       # A free string rather than a `choice` input: a choice list would repeat the
       # supported series here and drift from SUPPORTED_VERSIONS (the same list
       # build.sh and manifests/*.env agree with). A typo costs a five-second guard
       # failure, which is the point of checking it before validate.
-      - name: Manual dispatch version check
-        if: github.event_name == 'workflow_dispatch'
+      - name: Release scope check
         id: dispatch
         env:
           VERSION_INPUT: ${{ inputs.version }}
+          REVISION_INPUT: ${{ inputs.revision }}
         run: |
           set -eu
-          series="$VERSION_INPUT"
+          series="$(printf '%s' "$VERSION_INPUT" | tr 'A-Z' 'a-z')"
+          # The image revision is mandatory, because it is part of every published
+          # exact name: <full>-r<N>-<variant>. Asking rather than deriving it from the
+          # registry is deliberate -- two runs each concluding "I am r1" would fight
+          # over one published name -- and requiring it is what removes the old
+          # failure mode where a rebuild with no number republished the bare name over
+          # the snapshot the number exists to protect.
+          rev="$REVISION_INPUT"
+          if ! printf '%s' "$rev" | grep -Eq '^[1-9][0-9]*$'; then
+            echo "::error::revision '$rev' is not an image revision (expected a positive integer such as 1; published names are <php>-r<revision>-<variant>)"
+            exit 1
+          fi
+          # "all" is a formally supported value, not a convenience: it selects every
+          # supported series in this one run, so a full release is one validate, one
+          # matrix, one Overview sync -- and one read of the live registry by the
+          # SUPPORTED.md gate, which is the documentation check that cannot be true
+          # across eight separate runs (each later run reads digests another run
+          # wrote). It is also the reason this workflow needs no per-version release
+          # file: a new PHP series joins by adding a manifest and a SUPPORTED_VERSIONS
+          # row, and `all` starts publishing it with no pipeline edit.
+          if [ "$series" = "all" ]; then
+            # Comma-padded list of every supported series; the plan job turns it into
+            # the matrix this run builds.
+            selected=",$(printf '%s' "$SUPPORTED_VERSIONS" | tr ' ' ','),"
+            echo "Release scope: every supported PHP series ($SUPPORTED_VERSIONS), image revision r$rev"
+            echo "selected=$selected" >> "$GITHUB_OUTPUT"
+            echo "revision=$rev" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if ! printf '%s' "$series" | grep -Eq '^[0-9]+\.[0-9]+$'; then
-            echo "::error::version '$series' is not a PHP series (expected <major>.<minor>, e.g. 5.6)"
+            echo "::error::version '$series' is not a PHP series (expected <major>.<minor>, e.g. 5.6, or all for every supported series)"
             exit 1
           fi
           case " $SUPPORTED_VERSIONS " in
@@ -121,44 +250,9 @@ jobs:
               echo "::error::version '$series' names PHP series '$series', which is not supported (supported: $SUPPORTED_VERSIONS)"
               exit 1 ;;
           esac
-          echo "Manual release of PHP series $series"
-          echo "series=$series" >> "$GITHUB_OUTPUT"
-      - name: Release tag check
-        if: github.event_name == 'push'
-        id: tag
-        run: |
-          set -eu
-          tag="${GITHUB_REF#refs/tags/}"
-          # The trigger glob is "v*", so anything starting with v reaches this
-          # job -- v1-bump-notes, void-tools, a stray v8.1 from a shell history.
-          # Only a PHP version release may run a publish, so require the shape
-          # here, before validate or any build job starts: exactly vX.Y.Z, one
-          # tag per PHP version. A rebuild of that version does not add a tag --
-          # it moves v8.1.34 to the new commit, and the same <full>-<variant>
-          # tags are republished over the old ones. The OpenSSL route is
-          # deliberately not part of a tag name: the validate job below fixes one
-          # route per series, so the suffix could never express a choice. The
-          # cost of that is that a future route migration would republish the
-          # same name over a different libssl build -- so deployments pin by
-          # digest, and the route is read out of /opt/php/BUILD-PROVENANCE rather
-          # than guessed from a tag.
-          # Suffixes (v8.1.34-2, v8.1.34-rc1) are rejected so the tag namespace
-          # stays one-version-one-tag and cannot drift into parallel history.
-          if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "::error::tag '$tag' is not a release tag (expected exactly vX.Y.Z; a rebuild moves the existing tag instead of adding a suffix); no images will be pushed"
-            exit 1
-          fi
-          # And require the series it names to be a version this kit supports,
-          # so a typo (v8.11.34) cannot start a release run at all.
-          series="$(printf '%s' "${tag#v}" | cut -d. -f1,2)"
-          case " $SUPPORTED_VERSIONS " in
-            *" $series "*) ;;
-            *)
-              echo "::error::tag '$tag' names PHP series '$series', which is not supported (supported: $SUPPORTED_VERSIONS)"
-              exit 1 ;;
-          esac
-          echo "Releasing $tag (PHP series $series)"
-          echo "series=$series" >> "$GITHUB_OUTPUT"
+          echo "Release scope: PHP series $series, image revision r$rev"
+          echo "selected=,$series," >> "$GITHUB_OUTPUT"
+          echo "revision=$rev" >> "$GITHUB_OUTPUT"
 
   validate:
     needs: guard
@@ -396,194 +490,219 @@ jobs:
             exit 1
           fi
 
-      # The series this run publishes, not "any of them": a tag names one series,
-      # and an unreviewed or unfilled manifest for that series has to fail the run
-      # instead of going green with no image published. The same fields
+      # Every series this run publishes, not "any of them": an unreviewed or
+      # unfilled manifest has to fail the run instead of going green with no
+      # image published. For a version=all run that reading is deliberately
+      # strict -- a "full release" that published six series and skipped two is
+      # worse than one that never started, and the skipped series would still
+      # have had its floating tag repointed by nothing. The same fields
       # build-version.yml checks before it will start a build.
-      - name: Selected series is release-ready
+      - name: Selected series are release-ready
         env:
-          SERIES: ${{ needs.guard.outputs.series }}
+          SELECTED: ${{ needs.guard.outputs.selected }}
         run: |
           set -eu
-          [ -n "$SERIES" ] || { echo "::error::guard selected no PHP series"; exit 1; }
-          printf '%s' "$SERIES" | grep -Eq '^[0-9]+\.[0-9]+$' || {
-            echo "::error::guard produced an invalid series '$SERIES'"; exit 1; }
-          [ -f "manifests/$SERIES.env" ] || {
-            echo "::error::manifests/$SERIES.env is missing"; exit 1; }
-          # shellcheck source=/dev/null
-          . "manifests/$SERIES.env"
-          unready=""
-          for var in BASE_IMAGE SOURCE_REF PHP_SRC_COMMIT; do
-            eval "val=\${$var:-}"
-            case "$val" in ""|*REPLACE_WITH*) unready="${unready} ${var}" ;; esac
+          [ -n "$SELECTED" ] || { echo "::error::guard selected no PHP series"; exit 1; }
+          # ",5.6,7.0," -> the words 5.6 and 7.0. The comma padding leaves empty
+          # fields, which word splitting drops; set -f keeps a malformed value
+          # from globbing against the working tree.
+          set -f
+          # shellcheck disable=SC2086  # splitting the padded list is the point
+          set -- $(printf '%s' "$SELECTED" | tr ',' ' ')
+          set +f
+          # A list of nothing but separators. The guard cannot emit one today,
+          # but this step is the last place that knows what the run is supposed
+          # to publish, so it is the place to refuse: an empty loop below prints
+          # "release-ready" for zero series and the run would finish green with
+          # every build job skipped by its own gate.
+          [ "$#" -gt 0 ] || {
+            echo "::error::guard selected no PHP series to publish ('$SELECTED'); refusing to finish green with nothing published"; exit 1; }
+          for SERIES in "$@"; do
+            printf '%s' "$SERIES" | grep -Eq '^[0-9]+\.[0-9]+$' || {
+              echo "::error::guard produced an invalid series '$SERIES'"; exit 1; }
+            [ -f "manifests/$SERIES.env" ] || {
+              echo "::error::manifests/$SERIES.env is missing"; exit 1; }
+            # Cleared before sourcing so a manifest that omits a field cannot
+            # inherit the previous series' answer and read as ready.
+            unset BASE_IMAGE SOURCE_REF PHP_SRC_COMMIT PATCHSET_APPROVED
+            # Trusted project config, not untrusted input.
+            # shellcheck source=/dev/null
+            . "manifests/$SERIES.env"
+            unready=""
+            for var in BASE_IMAGE SOURCE_REF PHP_SRC_COMMIT; do
+              eval "val=\${$var:-}"
+              case "$val" in ""|*REPLACE_WITH*) unready="${unready} ${var}" ;; esac
+            done
+            # "@sha256:" alone is not a pin: the placeholder text has to be 64 hex.
+            case "${BASE_IMAGE:-}" in
+              *@sha256:*)
+                printf '%s' "${BASE_IMAGE##*@sha256:}" | grep -Eq '^[0-9a-f]{64}$' \
+                  || unready="${unready} BASE_IMAGE-digest" ;;
+              *) unready="${unready} BASE_IMAGE-pin" ;;
+            esac
+            [ "${PATCHSET_APPROVED:-0}" = "1" ] || unready="${unready} PATCHSET_APPROVED"
+            if [ -n "$unready" ]; then
+              echo "::error::PHP series $SERIES is not release-ready (unset or placeholder:${unready}); refusing to run an incomplete release"
+              exit 1
+            fi
+            echo "PHP series $SERIES is release-ready; publishing its declared variants ($(sed -n 's/^BUILD_VARIANTS="\(.*\)"/\1/p' "manifests/$SERIES.env"))"
           done
-          # "@sha256:" alone is not a pin: the placeholder text has to be 64 hex.
-          case "${BASE_IMAGE:-}" in
-            *@sha256:*)
-              printf '%s' "${BASE_IMAGE##*@sha256:}" | grep -Eq '^[0-9a-f]{64}$' \
-                || unready="${unready} BASE_IMAGE-digest" ;;
-            *) unready="${unready} BASE_IMAGE-pin" ;;
-          esac
-          [ "${PATCHSET_APPROVED:-0}" = "1" ] || unready="${unready} PATCHSET_APPROVED"
-          if [ -n "$unready" ]; then
-            echo "::error::PHP series $SERIES is not release-ready (unset or placeholder:${unready}); refusing to run an empty release"
-            exit 1
-          fi
-          echo "PHP series $SERIES is release-ready; publishing its declared variants ($(sed -n 's/^BUILD_VARIANTS="\(.*\)"/\1/p' "manifests/$SERIES.env"))"
+          echo "Selected series are release-ready: $*"
 
-  # --- One series per run ---------------------------------------------------
-  # Each job gates on guard's selected series, so exactly one of these builds:
-  # the version the tag names (or the dispatch input names). They all need guard
-  # as well as validate because a job can only read outputs from its own needs.
-  # Within the selected job, build-version.yml still covers cli + fpm on amd64
-  # and arm64, so "one series" is not "one image".
+  # --- One run, one dynamic matrix, one entry point --------------------------
+  # The scope the guard chose -- one series, or all of them -- becomes a matrix here
+  # instead of eight hand-written jobs. That is the payoff of separating the git tag
+  # from the build scope: adding PHP 8.2, 8.3 or another legacy line costs a manifest
+  # and a SUPPORTED_VERSIONS row, and version=all starts publishing it with nothing in
+  # this file edited. Eight static release-<series> jobs could not say that; each new
+  # series would need a new job, a new gate token, and a new assertion in
+  # tools/check-image-name.sh to keep the pair honest.
+  #
+  # plan turns the comma-padded selection into JSON; release calls the reusable build
+  # workflow once per entry. fail-fast is off on purpose -- one series' build failure
+  # must not cancel the healthy siblings that already have fixes to publish. Within one
+  # leg, build-version.yml still covers cli + fpm on amd64 and arm64, so "one series"
+  # is never "one image".
+  #
   # No caller here passes base_image_override: a release builds on the manifest's
   # reviewed BASE_IMAGE and nothing else, and build-version.yml fails the run if
-  # push=true ever arrives together with an override, so a trial cannot publish
-  # even through a future caller that forgot the rule.
-  release-5_6:
-    needs: [validate, guard]
-    if: needs.guard.outputs.series == '5.6'
+  # push=true ever arrives together with an override, so a trial cannot publish even
+  # through a future caller that forgot the rule.
+  plan:
+    needs: [guard, validate]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      # JSON array, one object per selected series. `php` is the manifest's SOURCE_REF
+      # -- the PHP version the *configuration* says this series is, not a tag and not
+      # an input -- carried into the matrix so the run log names the versions being
+      # published, and `variants` so it names what each series will publish.
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build the release matrix from the selected series
+        id: matrix
+        env:
+          SELECTED: ${{ needs.guard.outputs.selected }}
+        run: |
+          set -eu
+          # ",5.6,7.0," -> the words 5.6 and 7.0. The comma padding leaves empty
+          # fields, which word splitting drops; set -f keeps a malformed value from
+          # globbing against the working tree.
+          set -f
+          # shellcheck disable=SC2086  # splitting the padded list is the point
+          set -- $(printf '%s' "$SELECTED" | tr ',' ' ')
+          set +f
+          # validate's readiness step already refused an empty selection, so this is
+          # the second lock: a matrix of zero entries would run no build job at all,
+          # every later job would read it as skipped, and the run would still look
+          # like a release that published nothing.
+          [ "$#" -gt 0 ] || {
+            echo "::error::no PHP series was selected (guard emitted '${SELECTED:-<empty>}'); refusing to build an empty release matrix"
+            exit 1
+          }
+          json="["
+          first=1
+          for series in "$@"; do
+            # Read from the manifest rather than trusting the input, so the version in
+            # the published name has one source: the reviewed config.
+            php="$(sed -n 's/^SOURCE_REF="\(.*\)"/\1/p' "manifests/${series}.env")"
+            [ -n "$php" ] || {
+              echo "::error::manifests/${series}.env has no SOURCE_REF; the PHP version must come from the manifest, not from a tag or an input"
+              exit 1
+            }
+            variants="$(sed -n 's/^BUILD_VARIANTS="\(.*\)"/\1/p' "manifests/${series}.env")"
+            [ -n "$variants" ] || {
+              echo "::error::manifests/${series}.env declares no BUILD_VARIANTS"; exit 1
+            }
+            entry="$(printf '{"series":"%s","php":"%s","variants":"%s"}' "$series" "$php" "$variants")"
+            if [ "$first" = 1 ]; then
+              json="${json}${entry}"; first=0
+            else
+              json="${json},${entry}"
+            fi
+            echo "Release leg: PHP ${series} -> ${php} (${variants})"
+          done
+          json="${json}]"
+          printf 'matrix=%s\n' "$json" >> "$GITHUB_OUTPUT"
+          echo "Selected series: $* ($# of $(printf '%s' "$SUPPORTED_VERSIONS" | wc -w | tr -d ' ') supported)"
+
+  release:
+    needs: [guard, validate, plan]
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
     uses: ./.github/workflows/build-version.yml
     permissions:
       contents: read
       packages: write
       id-token: write
     with:
-      version: "5.6"
+      version: ${{ matrix.series }}
       push: true
+      # The image revision every published exact name carries
+      # (<php>-r<revision>-<variant>). It comes from the dispatch input rather than a
+      # tag, and every series in this run shares it -- which is what makes r2 one
+      # release of this kit instead of eight unrelated rebuilds.
+      revision: ${{ needs.guard.outputs.revision }}
+      # The git tag of the source being published. The guard above required the
+      # dispatched commit to carry it, and build-version.yml refuses push=true without
+      # it, so publishing from untagged source is blocked at both ends of the call.
+      source_release: ${{ needs.guard.outputs.release }}
       namespace: ${{ inputs.namespace || 'muffetlab' }}
-      attestations: ${{ github.event_name == 'push' || inputs.attestations }}
+      attestations: ${{ inputs.attestations }}
     secrets:
       token: ${{ secrets.GITHUB_TOKEN }}
       dockerhub_username: ${{ secrets.DOCKERHUB_USERNAME }}
       dockerhub_token: ${{ secrets.DOCKERHUB_TOKEN }}
 
-  release-7_0:
-    needs: [validate, guard]
-    if: needs.guard.outputs.series == '7.0'
-    uses: ./.github/workflows/build-version.yml
-    permissions:
-      contents: read
-      packages: write
-      id-token: write
-    with:
-      version: "7.0"
-      push: true
-      namespace: ${{ inputs.namespace || 'muffetlab' }}
-      attestations: ${{ github.event_name == 'push' || inputs.attestations }}
-    secrets:
-      token: ${{ secrets.GITHUB_TOKEN }}
-      dockerhub_username: ${{ secrets.DOCKERHUB_USERNAME }}
-      dockerhub_token: ${{ secrets.DOCKERHUB_TOKEN }}
+  # The Docker Hub mirror's Overview, once per release run. It is one document for the
+  # whole <user>/php repository rather than one per series, so it cannot live in the
+  # matrix: a version=all run has eight legs, and eight identical PATCH calls would
+  # report one release as eight -- and if leg three failed while leg seven succeeded,
+  # the document would be written by whichever finished last. One job, after the
+  # matrix, is the honest version of "the Overview matches this release".
+  #
+  # A README-only change still goes through tools/sync-dockerhub-readme.yml, which
+  # exists so the Overview can be re-synced without republishing an image.
+  mirror-readme:
+    needs: [guard, release]
+    # Only after a release that actually published: a failed or skipped matrix must not
+    # advertise a half-published set of images.
+    if: ${{ needs.release.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
 
-  release-7_1:
-    needs: [validate, guard]
-    if: needs.guard.outputs.series == '7.1'
-    uses: ./.github/workflows/build-version.yml
-    permissions:
-      contents: read
-      packages: write
-      id-token: write
-    with:
-      version: "7.1"
-      push: true
-      namespace: ${{ inputs.namespace || 'muffetlab' }}
-      attestations: ${{ github.event_name == 'push' || inputs.attestations }}
-    secrets:
-      token: ${{ secrets.GITHUB_TOKEN }}
-      dockerhub_username: ${{ secrets.DOCKERHUB_USERNAME }}
-      dockerhub_token: ${{ secrets.DOCKERHUB_TOKEN }}
-
-  release-7_2:
-    needs: [validate, guard]
-    if: needs.guard.outputs.series == '7.2'
-    uses: ./.github/workflows/build-version.yml
-    permissions:
-      contents: read
-      packages: write
-      id-token: write
-    with:
-      version: "7.2"
-      push: true
-      namespace: ${{ inputs.namespace || 'muffetlab' }}
-      attestations: ${{ github.event_name == 'push' || inputs.attestations }}
-    secrets:
-      token: ${{ secrets.GITHUB_TOKEN }}
-      dockerhub_username: ${{ secrets.DOCKERHUB_USERNAME }}
-      dockerhub_token: ${{ secrets.DOCKERHUB_TOKEN }}
-
-  release-7_3:
-    needs: [validate, guard]
-    if: needs.guard.outputs.series == '7.3'
-    uses: ./.github/workflows/build-version.yml
-    permissions:
-      contents: read
-      packages: write
-      id-token: write
-    with:
-      version: "7.3"
-      push: true
-      namespace: ${{ inputs.namespace || 'muffetlab' }}
-      attestations: ${{ github.event_name == 'push' || inputs.attestations }}
-    secrets:
-      token: ${{ secrets.GITHUB_TOKEN }}
-      dockerhub_username: ${{ secrets.DOCKERHUB_USERNAME }}
-      dockerhub_token: ${{ secrets.DOCKERHUB_TOKEN }}
-
-  release-7_4:
-    needs: [validate, guard]
-    if: needs.guard.outputs.series == '7.4'
-    uses: ./.github/workflows/build-version.yml
-    permissions:
-      contents: read
-      packages: write
-      id-token: write
-    with:
-      version: "7.4"
-      push: true
-      namespace: ${{ inputs.namespace || 'muffetlab' }}
-      attestations: ${{ github.event_name == 'push' || inputs.attestations }}
-    secrets:
-      token: ${{ secrets.GITHUB_TOKEN }}
-      dockerhub_username: ${{ secrets.DOCKERHUB_USERNAME }}
-      dockerhub_token: ${{ secrets.DOCKERHUB_TOKEN }}
-
-  release-8_0:
-    needs: [validate, guard]
-    if: needs.guard.outputs.series == '8.0'
-    uses: ./.github/workflows/build-version.yml
-    permissions:
-      contents: read
-      packages: write
-      id-token: write
-    with:
-      version: "8.0"
-      push: true
-      namespace: ${{ inputs.namespace || 'muffetlab' }}
-      attestations: ${{ github.event_name == 'push' || inputs.attestations }}
-    secrets:
-      token: ${{ secrets.GITHUB_TOKEN }}
-      dockerhub_username: ${{ secrets.DOCKERHUB_USERNAME }}
-      dockerhub_token: ${{ secrets.DOCKERHUB_TOKEN }}
-
-  release-8_1:
-    needs: [validate, guard]
-    if: needs.guard.outputs.series == '8.1'
-    uses: ./.github/workflows/build-version.yml
-    permissions:
-      contents: read
-      packages: write
-      id-token: write
-    with:
-      version: "8.1"
-      push: true
-      namespace: ${{ inputs.namespace || 'muffetlab' }}
-      attestations: ${{ github.event_name == 'push' || inputs.attestations }}
-    secrets:
-      token: ${{ secrets.GITHUB_TOKEN }}
-      dockerhub_username: ${{ secrets.DOCKERHUB_USERNAME }}
-      dockerhub_token: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Sync the Docker Hub mirror's Overview once for this release
+        # continue-on-error because by now the tags and layers are published: a red
+        # step at the tail of a good release invites someone to re-run the workflow,
+        # and re-running it re-pushes images to fix a documentation pane. The script
+        # does not soften its own outcome -- it prints a ::error:: naming the HTTP
+        # code and whether the token or the repository is at fault.
+        continue-on-error: true
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.dockerhub_username }}
+          DOCKERHUB_TOKEN: ${{ secrets.dockerhub_token }}
+          RELEASE: ${{ needs.guard.outputs.release }}
+          REVISION: ${{ needs.guard.outputs.revision }}
+        run: |
+          set -eu
+          # The mirror test is in the shell, not the "if:", on purpose. GitHub does not
+          # give a step condition the secrets context (only env/vars/steps/matrix), so
+          # an expression here could not prove the secret exists -- it would read an
+          # unset env var as the empty string and skip quietly, which is the same
+          # answer as "no mirror configured". Saying which of the two happened is worth
+          # a line of output, and the line below is only reached with both set.
+          if [ -z "${DOCKERHUB_USERNAME:-}" ] || [ -z "${DOCKERHUB_TOKEN:-}" ]; then
+            echo "No Docker Hub mirror secrets on this repository, so there is no <user>/php repository to write an Overview for, and nothing here was skipped by accident. ${RELEASE} published to GHCR only, as revision r${REVISION}."
+            exit 0
+          fi
+          echo "One Overview call for the whole release run (${RELEASE}, image revision r${REVISION}); this is that call."
+          ./tools/sync-dockerhub-readme.sh
 
   # GHCR packages are created private on first push. GITHUB_TOKEN cannot
   # change package visibility, so this step uses an optional GHCR_PAT secret
@@ -598,14 +717,14 @@ jobs:
   # layers are already published by the time this runs, and an unreadable
   # package is fixed in package settings, not by failing a release.
   package-visibility:
-    # Not release-8_1 alone: a run now publishes one series, and a skipped
-    # dependency skips its dependents -- so a v5.6.40 tag would have skipped this
-    # job whenever 8.1 was not the one being released. List every release job and
-    # run when at least one of them published and none failed or was cancelled;
-    # if validate or guard stopped the run, all eight are skipped and the
-    # "contains a success" test is what keeps an empty release from reaching here.
-    needs: [release-5_6, release-7_0, release-7_1, release-7_2, release-7_3, release-7_4, release-8_0, release-8_1]
-    if: ${{ always() && contains(needs.*.result, 'success') && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
+    # The matrix job, not one series: a run publishes the series it selects, and a
+    # skipped dependency skips its dependents -- so depending on a single series'
+    # job would have hidden this check from every release that did not include it.
+    # One matrix job now covers both run types, and its result is the release's
+    # result: success means every selected series published on every leg, so an
+    # empty or failed release never reaches here to report on nothing.
+    needs: [release]
+    if: ${{ needs.release.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
