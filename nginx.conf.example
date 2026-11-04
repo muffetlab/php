@@ -36,7 +36,7 @@ server {
         try_files $uri =404;
         include fastcgi_params;
         fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
-        fastcgi_pass php56:9000;
+        fastcgi_pass php81:9000;
     }
 
     location ~ /\.(?!well-known) {
