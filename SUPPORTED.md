@@ -102,7 +102,7 @@ precondition for a release, not a claim that one happened.
 
 What it answered, per series and variant:
 
-<!-- generated at 2026-11-06T00:28:38Z -->
+<!-- generated at 2026-11-06T01:24:52Z -->
 - 7.0: `cli` `7.0-cli` / `7.0.33-cli` → `sha256:e0803ef8dafcb942a1c2ccdec3f74e185ea7775f56ba2084104b36a2aedd4180`, `fpm` `7.0-fpm` / `7.0.33-fpm` → `sha256:d258bc3b271145ed7d4cc568f800effb27f05016b1c3c42cd06b616d1da68dee`
 - 7.1: `cli` `7.1-cli` / `7.1.33-cli` → `sha256:9c5b838338a3f33e588b9d62a0abde268bee7dc198f30f4ccbc28c6628833440`, `fpm` `7.1-fpm` / `7.1.33-fpm` → `sha256:b7ed1e71f1bb8f24d6a05cce22f992adf7bba0b74972a3c86ceb1cf063594f0e`
 - 7.2: `cli` `7.2-cli` / `7.2.34-cli` → `sha256:a1865f96a8355ba01a0248c4cea12b9437c41e12f3e08d52e0d05cde1146ea31`, `fpm` `7.2-fpm` / `7.2.34-fpm` → `sha256:cc57e47f79691a5b3d9f380637a3fc6a77159fd3f9573eb9916ef68e9b48d687`
