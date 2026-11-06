@@ -7,37 +7,72 @@ name: release
 # name "php"). The namespace is the GHCR owner, so a fork overrides it with its
 # own GitHub user/org.
 #
-# Four roles, kept deliberately apart -- this is the whole release model, and it
+# Three entries, one pipeline: every release -- whatever started it -- goes through
+# the same guard, the same validate gate, the same version resolution
+# (tools/release-plan.sh) and the same dynamic matrix, so no published name is ever
+# composed from two different readings of the same fact:
+#   A. push a conforming vMAJOR.MINOR.PATCH tag -> every supported series, the
+#      formal release. The tag is both the source marker and the scope: all of them.
+#   B. dispatch with version=<series> (e.g. 8.1) -> that one series: a fix, a
+#      rebuild, a targeted release.
+#   C. dispatch with version=<series>,<series>,... or version=all -> several or
+#      every series in one run: a batch update, one validate, one matrix, one
+#      SUPPORTED.md read, one Overview sync.
+# An entry that names no series is refused rather than read as "all": a blank
+# dispatch must not publish eight images by accident, and neither must it finish
+# green having published none.
+#
+# Five roles, kept deliberately apart -- this is the whole release model, and it
 # is what lets a new PHP series join without touching the pipeline:
-#   - A git tag marks a SOURCE RELEASE: vMAJOR.MINOR.PATCH (v1.0.0). It selects
-#     no PHP version, carries no build number, and contributes nothing to an image
+#   - A git tag marks a SOURCE RELEASE: vMAJOR.MINOR.PATCH (v1.0.0). It names no
+#     PHP version, carries no build number, and contributes nothing to an image
 #     name. Its one job is to answer "which commit of this repository is official
-#     source", and this workflow requires the commit it publishes from to carry
-#     one -- see the guard job.
-#   - This Actions workflow input chooses the SCOPE: version is one PHP series
-#     (8.1) or all (every supported series, in this one run), and revision is the
-#     image revision (r1, r2, ...). There is exactly one release entry point and
-#     one release workflow; adding PHP 8.2, 8.3 or a dozen legacy lines adds a
-#     manifest, not a workflow.
+#     source". Pushing one additionally starts entry A, which is the one release
+#     action a human can take with no form open -- and a tag whose name is not
+#     exactly that shape is refused by the guard before any build job exists.
+#   - The scope says which PHP series this run publishes: every supported series
+#     for entry A, the series (or list, or all) typed into the dispatch form for
+#     B and C. There is one release workflow for all three; adding PHP 8.2, 8.3 or
+#     a dozen legacy lines adds a manifest, not a workflow.
 #   - manifests/<series>.env holds the PHP VERSION itself (SOURCE_REF, e.g.
 #     8.1.34) together with the base-image and php-src pins. The published exact
 #     name is composed from the version the image was actually built at, never
 #     from a tag name.
+#   - The registry holds the image REVISION. tools/release-plan.sh reads the exact
+#     names already published for each PHP point version and proposes one higher,
+#     per point version -- r2 on 8.1.34 says nothing about 7.4.33. A dispatch no
+#     longer types a build number in, so two runs cannot both claim to be the first
+#     build of the same version, and a full release whose inputs have not moved
+#     skips the series that is already current instead of churning a new snapshot.
+#     The verdict has three answers, not two, because a release can fail after
+#     publishing only part of a revision: SKIP (every declared variant is served at
+#     the newest revision with the manifest's four pins), COMPLETE (some declared
+#     variant is not served there and none that is has a moved pin, so the series is
+#     finished at the revision it was started at instead of being incremented),
+#     PUBLISH (a served pin moved, or its build record cannot be read at all -- the
+#     whole series goes one revision higher). The verdict travels to the build job
+#     as `mode`; MAINTAINING.md ("Publishing images") has the three of them.
 #   - Docker tags express the RESULT: php:<minor>-<variant> (8.1-fpm) floats to
 #     the newest build of that series, and php:<full>-r<revision>-<variant>
 #     (8.1.34-r1-fpm) is an immutable snapshot of one build.
 #
-# Trigger: workflow_dispatch from the default branch (main or master) and nothing
-# else. A tag push cannot carry a scope, so publishing has one entry point -- the
-# dispatch below -- and pushing a tag starts no build. Because every publishing run
-# is a dispatch on the branch ref, the concurrency group below makes two releases
-# queue instead of racing, whatever series each names.
+# Concurrency: one group for every publishing run, main or tag, because both can
+# move the same <minor>-<variant> name and because the revision is read from the
+# registry rather than typed in. Two releases queue instead of racing; a queued
+# release is a better failure than one cancelled mid-publish.
 #
-# What a run publishes: the exact <full>-r<revision>-<variant> name composed from
-# the PHP version the image reports, plus the floating <minor>-<variant> name. An
-# OS security update that does not move the PHP pin bumps the revision (r1 -> r2)
-# and publishes beside the old snapshot rather than over it. Nothing here counts
-# builds by asking the registry, and no run writes a latest tag -- see below.
+# What a run publishes: for each series it selected and did not skip, the exact
+# <full>-r<revision>-<variant> name composed from the PHP version the image
+# reports, plus the floating <minor>-<variant> name. An OS security update that
+# does not move the PHP pin bumps the revision (r1 -> r2) and publishes beside the
+# old snapshot rather than over it -- which is what the registry read is for. The
+# verdict travels with the leg as `mode`, and it decides what finding that exact
+# name already served means: on a publish leg it is the registry having moved
+# under the run, so the write is refused rather than one revision number coming to
+# mean two pinsets; on a complete leg it is this release being already
+# half-published, so that snapshot is left exactly as it is and only the missing
+# half -- and any registry the earlier run did not reach -- is written. No run
+# writes a latest tag -- see below.
 #
 # Safety model:
 #   - No :latest-<variant>, and no plain :latest either. A run publishes the series
@@ -57,14 +92,20 @@ name: release
 #     and linux/arm64, pushes the per-arch images by digest, and merges them into
 #     one multi-arch manifest list per tag, so every published name resolves on
 #     both architectures.
-#   - build-version.yml independently refuses push unless github.ref is the branch
-#     it accepts (main or master) *and* source_release names a tagged source
-#     release (vMAJOR.MINOR.PATCH), and only release.yml passes push=true -- so
+#   - build-version.yml independently refuses push unless github.ref is a ref it
+#     accepts -- the branch a dispatch ran on (main or master) or a tag whose name
+#     is exactly vMAJOR.MINOR.PATCH -- *and* source_release names that tagged
+#     source release, and only release.yml passes push=true -- so
 #     the requirement that published images come from tagged source is enforced
 #     both where the scope is chosen and where the registry is written.
-#   - A run publishes the series it selects: one series for a version=8.1 dispatch,
-#     every supported series for version=all, in one run, as one dynamic matrix of
-#     build jobs. The series a run does not select stay on their previous build,
+#   - A run publishes the series it selects and did not skip: one series for a
+#     version=8.1 dispatch, the listed series for version=8.1,7.4, every supported
+#     series for version=all or for a tag push -- in one run, as one dynamic matrix
+#     of build jobs. A selected series whose current inputs are already what the
+#     registry serves is reported as skipped and left out of the matrix; the
+#     difference is the four pins the published image labels into its own config,
+#     so the answer comes from the image rather than from a note in this repo. The
+#     series a run does not select stay on their previous build,
 #     including their previous base digest, until a later run selects them. Doing
 #     a full release in one run is also what makes the SUPPORTED.md gate honest:
 #     it reads the live registry once, in validate, before any of the matrix legs
@@ -75,56 +116,56 @@ name: release
 #     release as eight.
 
 on:
-  # Dispatch only, and only from the default branch (the guard job below enforces
-  # that, because workflow_dispatch has no branch filter). A git tag push cannot
-  # carry the scope inputs, so tags mark source releases and start no build.
+  # Entry A: a conforming source release tag publishes every supported series.
+  # GitHub's tag filter is a glob and not a regex, so `v*.*.*` also matches
+  # v1.0.0-rc1 -- the guard job's first step is what decides, before any build job
+  # exists, and a name that is not exactly vMAJOR.MINOR.PATCH ends the run there
+  # having published nothing. A tag that does not look like a version at all (a
+  # docs tag, or the legacy v7.4.33-legacy shape) starts no run whatever it is
+  # named, which is what the filter is for.
+  push:
+    tags:
+      - 'v*.*.*'
+  # Entries B and C: a dispatch, from the default branch only (the guard below
+  # enforces the branch, because workflow_dispatch has no branch filter).
   workflow_dispatch:
     inputs:
       version:
-        # One PHP series (8.1) or the literal all (every supported series, in this
-        # one run). A free string rather than a `choice` menu on purpose: a menu
-        # would repeat SUPPORTED_VERSIONS here and drift from it, and adding PHP 8.2
-        # should cost a manifest, not an edit to the release pipeline.
-        description: "PHP series to release (e.g. 8.1), or all for every supported series"
+        # One PHP series (8.1), several (8.1,7.4), or the literal all (every
+        # supported series in this one run). A free string rather than a `choice`
+        # menu on purpose: a menu would repeat SUPPORTED_VERSIONS here and drift
+        # from it, and adding PHP 8.2 should cost a manifest, not an edit to the
+        # release pipeline.
+        description: "PHP series to release (e.g. 8.1), several as a list (8.1,7.4), or all for every supported series"
         type: string
         required: true
         default: "8.1"
-      revision:
-        # The image revision, written into the immutable name as -r<N>: that is
-        # 8.1.34-r1-fpm, and the next fix on the same PHP pin is 8.1.34-r2-fpm
-        # published beside it. Asked for rather than derived from the registry,
-        # because two runs each concluding "I am r1" would fight over one published
-        # name. Required and always positive: every exact name carries a revision,
-        # so there is no bare <full>-<variant> name for a rebuild to overwrite. One
-        # number per run, shared by every series an all-run publishes, which is what
-        # makes r2 a single release of this kit rather than eight unrelated builds.
-        description: "Image revision number (1 = first build of the PHP version in the manifests, 2 = the next fix; applies to every series in this run)"
-        type: string
-        required: true
-        default: "1"
       namespace:
         description: "GHCR owner/namespace that hosts the php image (default: muffetlab)"
         type: string
         default: "muffetlab"
       attestations:
-        # With no tag-triggered path left, the checkbox is the whole decision: a
-        # dispatch that unchecks it gets no attestations, and the release job passes
-        # the value through to every matrix leg.
+        # The image revision is not an input any more: it is read out of the
+        # registry per PHP point version by tools/release-plan.sh, so there is
+        # nothing to type and nothing for two runs to disagree about.
+        # A tag-triggered run has no form, so it gets the default below.
         description: "Attach provenance/SBOM attestations"
         type: boolean
         default: true
 
 concurrency:
-  # Every publishing run is a dispatch on the default branch, so they all land in
-  # one group and queue instead of racing -- which covers the case the old
-  # tag-per-series model could not: a version=all run and a single-series dispatch
-  # can both move the same <minor>-<variant> name, and on separate refs nothing
-  # would have stopped them. Releases of different series therefore queue behind
-  # each other too; that is the cheap price of never having two runs fight over one
-  # floating name.
+  # One group for every publishing run, whatever started it or which series it
+  # names. Two reasons, and both come from what entry A made true: a tag run and a
+  # dispatch can move the same <minor>-<variant> name, and the image revision is
+  # now read out of the registry rather than typed in -- two runs in flight would
+  # both conclude "I am r2" and the second would be refused at the write, after
+  # thirty minutes of building. Queuing is cheaper than that, and it is the whole
+  # reason the derived revision can be trusted: release-plan.sh's read and
+  # build-version.yml's write happen with no other publishing run between them.
+  # Per-series groups would be faster and wrong: ",8.1," and "all" overlap.
   # cancel-in-progress stays false: a release cancelled mid-publish leaves some
   # tags written and some not, and a queued release is the better failure.
-  group: release-${{ github.ref }}
+  group: release
   cancel-in-progress: false
 
 env:
@@ -135,30 +176,60 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
-      # The source release being published -- the git tag that points at the commit
-      # this run is dispatching from (vMAJOR.MINOR.PATCH). A git tag marks source; it
-      # selects no PHP version, carries no image revision, and appears nowhere in a
-      # published name. It is here because publishing from untagged source is refused,
+      # The source release being published -- the git tag whose commit this run
+      # builds from (vMAJOR.MINOR.PATCH). A git tag marks source; it names no PHP
+      # version, carries no image revision, and appears nowhere in a published
+      # name. It is here because publishing from untagged source is refused,
       # so every image in the registry answers "which reviewed commit is this".
       release: ${{ steps.srctag.outputs.release }}
-      # The PHP series this run publishes, as the comma-padded list the release matrix
-      # is built from: ",8.1," for version=8.1, and ",5.6,7.0,...,8.1," for version=all.
+      # The PHP series this run publishes, as the comma-padded list the readiness
+      # step and the release matrix are built from: ",8.1," for version=8.1,
+      # ",8.1,7.4," for a list, and ",5.6,7.0,...,8.1," for all -- which is also
+      # what a tag push always selects.
       # Padded on both sides so one series can never match inside another the way a
       # bare substring search would -- ",8.1," is not inside ",8.10,". Empty selects
       # nothing, and the readiness step below treats that as a failure instead of
       # letting the run go green with an empty matrix.
-      selected: ${{ steps.dispatch.outputs.selected }}
-      # The image revision every published exact name carries: php:<full>-r<N>-<variant>.
-      revision: ${{ steps.dispatch.outputs.revision }}
+      selected: ${{ steps.scope.outputs.selected }}
+      # Which of the three entries started this run: A is the tag push, B a
+      # dispatch that named one series, C a dispatch that named several or all.
+      # Counted here rather than trusted from the form, because what the run is
+      # about to publish depends on it.
+      entry: ${{ steps.scope.outputs.entry }}
     steps:
-      - name: Release allowed only from the default branch
-        # Not just a branch rule any more: with no tag-push path, a run that was not
-        # dispatched from the default branch has no business holding registry
-        # credentials whatever its ref looks like.
-        if: github.event_name != 'workflow_dispatch' || !(github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+      - name: Release allowed only from a conforming tag or the default branch
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
         run: |
-          echo "::error::release runs only from a workflow_dispatch on main or master (a git tag marks source and publishes nothing by itself)"
-          exit 1
+          set -eu
+          case "$EVENT" in
+            push)
+              # Entry A. GitHub filtered the tag to v*.*.* first, and that is a glob,
+              # so v1.0.0-rc1 reaches this step too. The shape is decided here, before
+              # a checkout, a build, or a credential: a tag that is not exactly
+              # vMAJOR.MINOR.PATCH publishes nothing.
+              tag="${REF#refs/tags/}"
+              if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+                echo "::error::pushed tag '$tag' is not a source release tag (expected exactly vMAJOR.MINOR.PATCH, e.g. v1.0.0), so nothing was published from it. A pre-release or a trial tag should be named outside the v*.*.* filter -- e.g. rc-1.0.0 -- so this workflow is not started at all"
+                exit 1
+              fi
+              ;;
+            workflow_dispatch)
+              # Not just a branch rule any more: with two entries, a run that was
+              # neither dispatched from the default branch nor pushed as a release tag
+              # has no business holding registry credentials whatever its ref looks
+              # like.
+              if [ "$REF" != refs/heads/main ] && [ "$REF" != refs/heads/master ]; then
+                echo "::error::a dispatch publishes only from main or master (this run is on $REF); pushing a tag is the other entry, and there is no third"
+                exit 1
+              fi
+              ;;
+            *)
+              echo "::error::release runs only from a source release tag push or a workflow_dispatch on the default branch (this event is '$EVENT'); a pull request or a branch push cannot reach a registry"
+              exit 1
+              ;;
+          esac
 
       - uses: actions/checkout@v7
         with:
@@ -172,30 +243,50 @@ jobs:
         id: srctag
         env:
           SHA: ${{ github.sha }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
         run: |
           set -eu
           # A git tag marks a source release. It does not name a PHP version, does not
           # carry the image revision, and contributes nothing to an image name -- which
           # is exactly why one tag can cover a release of eight series: the scope came
-          # from the workflow input, and the tag is left alone to do the one thing it
-          # is good at, recording which commit of this repository is official source.
-          # Tags are still never moved, so the namespace stays an append-only history
-          # of source releases. What it no longer claims to be is a history of builds:
-          # that is the registry's -r<N> namespace, and SUPPORTED.md reads it live.
-          # grep with no match would end the step on its exit status, so || true keeps
-          # the empty answer on the path that prints the real message.
-          tags="$(git tag --points-at "$SHA" | { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; } | sort -V)"
-          if [ -z "$tags" ]; then
-            echo "::error::commit $(printf '%.10s' "$SHA") carries no source release tag (expected vMAJOR.MINOR.PATCH, e.g. git tag v1.0.0 && git push origin v1.0.0); refusing to publish an image whose source is not a tagged release"
+          # from the entry (every series for a tag, the form for a dispatch), and the
+          # tag is left alone to do the one thing it is good at, recording which commit
+          # of this repository is official source. Tags are still never moved, so the
+          # namespace stays an append-only history of source releases. What it no
+          # longer claims to be is a history of builds: that is the registry's -r<N>
+          # namespace, and SUPPORTED.md reads it live.
+          case "$EVENT" in
+            push)
+              # The ref this run is on *is* the source release, and the entry step
+              # above already refused a name that is not one.
+              release="${REF#refs/tags/}"
+              ;;
+            workflow_dispatch)
+              # grep with no match would end the step on its exit status, so || true
+              # keeps the empty answer on the path that prints the real message.
+              tags="$(git tag --points-at "$SHA" | { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; } | sort -V)"
+              if [ -z "$tags" ]; then
+                echo "::error::commit $(printf '%.10s' "$SHA") carries no source release tag (expected vMAJOR.MINOR.PATCH, e.g. git tag v1.0.0 && git push origin v1.0.0); refusing to publish an image whose source is not a tagged release"
+                exit 1
+              fi
+              count="$(printf '%s\n' "$tags" | wc -l | tr -d ' ')"
+              # Two release tags on one commit is legal but ambiguous. Publish under the
+              # highest rather than whichever git happens to list first, and say so --
+              # the commit is the same either way, so this changes only the label.
+              release="$(printf '%s\n' "$tags" | tail -1)"
+              if [ "$count" != 1 ]; then
+                echo "Notice: ${count} source release tags point at this commit ($(printf '%s\n' "$tags" | tr '\n' ' ')); publishing under ${release}"
+              fi
+              ;;
+          esac
+          # Both entries end with the same proof, asked of git rather than of the
+          # event: "published from ${release}" is a claim about this commit, and it is
+          # cheap to verify here rather than to have a consumer disprove from the
+          # image's dev.php-legacy.source-release label.
+          if ! git tag --points-at "$SHA" | grep -Fxq -- "$release"; then
+            echo "::error::source release tag ${release} does not point at commit $(printf '%.10s' "$SHA"); refusing to publish an image labelled with a release it was not built from"
             exit 1
-          fi
-          count="$(printf '%s\n' "$tags" | wc -l | tr -d ' ')"
-          # Two release tags on one commit is legal but ambiguous. Publish under the
-          # highest rather than whichever git happens to list first, and say so -- the
-          # commit is the same either way, so this changes only the label.
-          release="$(printf '%s\n' "$tags" | tail -1)"
-          if [ "$count" != 1 ]; then
-            echo "Notice: ${count} source release tags point at this commit ($(printf '%s\n' "$tags" | tr '\n' ' ')); publishing under ${release}"
           fi
           echo "Publishing source release ${release} at commit $(printf '%.10s' "$SHA"), on $(git log -1 --format=%s)"
           echo "release=${release}" >> "$GITHUB_OUTPUT"
@@ -205,24 +296,13 @@ jobs:
       # build.sh and manifests/*.env agree with). A typo costs a five-second guard
       # failure, which is the point of checking it before validate.
       - name: Release scope check
-        id: dispatch
+        id: scope
         env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
           VERSION_INPUT: ${{ inputs.version }}
-          REVISION_INPUT: ${{ inputs.revision }}
         run: |
           set -eu
-          series="$(printf '%s' "$VERSION_INPUT" | tr 'A-Z' 'a-z')"
-          # The image revision is mandatory, because it is part of every published
-          # exact name: <full>-r<N>-<variant>. Asking rather than deriving it from the
-          # registry is deliberate -- two runs each concluding "I am r1" would fight
-          # over one published name -- and requiring it is what removes the old
-          # failure mode where a rebuild with no number republished the bare name over
-          # the snapshot the number exists to protect.
-          rev="$REVISION_INPUT"
-          if ! printf '%s' "$rev" | grep -Eq '^[1-9][0-9]*$'; then
-            echo "::error::revision '$rev' is not an image revision (expected a positive integer such as 1; published names are <php>-r<revision>-<variant>)"
-            exit 1
-          fi
           # "all" is a formally supported value, not a convenience: it selects every
           # supported series in this one run, so a full release is one validate, one
           # matrix, one Overview sync -- and one read of the live registry by the
@@ -230,29 +310,80 @@ jobs:
           # across eight separate runs (each later run reads digests another run
           # wrote). It is also the reason this workflow needs no per-version release
           # file: a new PHP series joins by adding a manifest and a SUPPORTED_VERSIONS
-          # row, and `all` starts publishing it with no pipeline edit.
-          if [ "$series" = "all" ]; then
+          # row, and `all` starts publishing it with no pipeline edit. A tag push
+          # takes that path without anyone typing it.
+          if [ "$EVENT" = push ]; then
+            # The first step refused a push standing on anything but a conforming
+            # tag, and this says the same thing from the ref rather than from the
+            # event name: the two steps must not be one edit away from disagreeing
+            # about what an untyped "all" covers.
+            case "$REF" in
+              refs/tags/*) ;;
+              *) echo "::error::only a tag push selects every series without a form ($REF is not a tag ref); the pushed tag's shape is the first step's check, this one is that it is a tag at all"; exit 1 ;;
+            esac
+            raw=all
+          else
+            raw="$VERSION_INPUT"
+          fi
+          raw="$(printf '%s' "$raw" | tr -d '[:space:]')"
+          # An empty scope is refused, never interpreted. Reading "" as "all"
+          # publishes eight series from a form that asked for none; reading it as
+          # "none" finishes a release run green with nothing published. Both are
+          # worse than a five-second failure that says what to type.
+          if [ -z "$raw" ]; then
+            echo "::error::no PHP series was selected: a dispatch with an empty version field is refused rather than read as 'all'. Type one series (8.1), a list (8.1,7.4), or all -- or push a vMAJOR.MINOR.PATCH tag, which selects every supported series"
+            exit 1
+          fi
+          if [ "$raw" = all ]; then
             # Comma-padded list of every supported series; the plan job turns it into
             # the matrix this run builds.
             selected=",$(printf '%s' "$SUPPORTED_VERSIONS" | tr ' ' ','),"
-            echo "Release scope: every supported PHP series ($SUPPORTED_VERSIONS), image revision r$rev"
-            echo "selected=$selected" >> "$GITHUB_OUTPUT"
-            echo "revision=$rev" >> "$GITHUB_OUTPUT"
-            exit 0
+          else
+            # One series or several, and the same two checks for each: shaped like a
+            # PHP series, and actually supported. A list is expanded here so nothing
+            # downstream ever has to parse a comma again.
+            listed=""
+            # shellcheck disable=SC2086  # splitting the caller's list into words is the point
+            for item in $(printf '%s' "$raw" | tr ',' ' '); do
+              if ! printf '%s' "$item" | grep -Eq '^[0-9]+\.[0-9]+$'; then
+                echo "::error::version '$item' is not a PHP series (expected <major>.<minor>, e.g. 5.6; a comma-separated list of them; or all for every supported series)"
+                exit 1
+              fi
+              case " $SUPPORTED_VERSIONS " in
+                *" $item "*) ;;
+                *)
+                  echo "::error::version '$item' names PHP series '$item', which is not supported (supported: $SUPPORTED_VERSIONS)"
+                  exit 1 ;;
+              esac
+              case ",$listed," in
+                *",$item,"*) echo "::warning::version '$raw' lists ${item} twice; publishing it once" ;;
+                # Joined without a leading separator, so the padded list this step
+                # outputs is the one its own comment documents: ",8.1," for
+                # version=8.1, not ",,8.1,".
+                *) if [ -z "$listed" ]; then listed="$item"; else listed="${listed},${item}"; fi ;;
+              esac
+            done
+            selected=",$listed,"
           fi
-          if ! printf '%s' "$series" | grep -Eq '^[0-9]+\.[0-9]+$'; then
-            echo "::error::version '$series' is not a PHP series (expected <major>.<minor>, e.g. 5.6, or all for every supported series)"
-            exit 1
+          set -f
+          # shellcheck disable=SC2086  # splitting the padded list is the point
+          set -- $(printf '%s' "$selected" | tr ',' ' ')
+          set +f
+          [ "$#" -gt 0 ] || {
+            echo "::error::version '$raw' selected no PHP series"; exit 1; }
+          # A, B, C are named by what the run was asked to publish, not by how it
+          # was typed: the tag is A, one series from the form is B, and more than
+          # one -- listed or all -- is C.
+          if [ "$EVENT" = push ]; then
+            entry=A
+          elif [ "$#" -gt 1 ] || [ "$raw" = all ]; then
+            entry=C
+          else
+            entry=B
           fi
-          case " $SUPPORTED_VERSIONS " in
-            *" $series "*) ;;
-            *)
-              echo "::error::version '$series' names PHP series '$series', which is not supported (supported: $SUPPORTED_VERSIONS)"
-              exit 1 ;;
-          esac
-          echo "Release scope: PHP series $series, image revision r$rev"
-          echo "selected=,$series," >> "$GITHUB_OUTPUT"
-          echo "revision=$rev" >> "$GITHUB_OUTPUT"
+          echo "Release entry ${entry}: $# PHP series ($*), image revisions from the registry"
+          echo "selected=${selected}" >> "$GITHUB_OUTPUT"
+          echo "entry=${entry}" >> "$GITHUB_OUTPUT"
 
   validate:
     needs: guard
@@ -290,6 +421,14 @@ jobs:
       - name: OS gate verdict harness
         run: |
           ./tests/scan-image-harness.sh
+
+      # Same reason as in build-and-verify.yml, and the same warning: this is the
+      # gate in front of a push, so the step that decides which exact tag each
+      # series gets is checked here against a fake registry read rather than
+      # discovered by a release that overwrote -- or skipped -- a real name.
+      - name: Release-plan harness
+        run: |
+          ./tests/release-plan-harness.sh
 
       - name: Version-branch inventory in sync
         run: |
@@ -552,17 +691,31 @@ jobs:
           done
           echo "Selected series are release-ready: $*"
 
-  # --- One run, one dynamic matrix, one entry point --------------------------
-  # The scope the guard chose -- one series, or all of them -- becomes a matrix here
-  # instead of eight hand-written jobs. That is the payoff of separating the git tag
-  # from the build scope: adding PHP 8.2, 8.3 or another legacy line costs a manifest
-  # and a SUPPORTED_VERSIONS row, and version=all starts publishing it with nothing in
-  # this file edited. Eight static release-<series> jobs could not say that; each new
-  # series would need a new job, a new gate token, and a new assertion in
+  # --- Three entries, one version resolution, one dynamic matrix ----------------
+  # Whatever started the run -- a tag, one series, a list, or all of them -- the
+  # scope becomes a matrix here instead of eight hand-written jobs, and the matrix
+  # comes from one resolver rather than from this file. That is the payoff of
+  # keeping the git tag, the PHP version and the image revision apart: adding PHP
+  # 8.2, 8.3 or another legacy line costs a manifest and a SUPPORTED_VERSIONS row,
+  # and a tag push or version=all starts publishing it with nothing in this file
+  # edited. Eight static release-<series> jobs could not say that; each new series
+  # would need a new job, a new gate token, and a new assertion in
   # tools/check-image-name.sh to keep the pair honest.
   #
-  # plan turns the comma-padded selection into JSON; release calls the reusable build
-  # workflow once per entry. fail-fast is off on purpose -- one series' build failure
+  # tools/release-plan.sh answers three questions per selected series, in one read
+  # of the registry, and nothing else in the pipeline is allowed to answer them:
+  #   - which PHP version (manifests/<series>.env SOURCE_REF),
+  #   - which image revision (one above the highest -r<N> GHCR already serves for
+  #     that point version, counted across the variants the series declares), and
+  #   - whether there is anything to publish at all (a series whose published build
+  #     record already matches the manifest's four pins is reported as skipped and
+  #     left out of the matrix rather than rebuilt into a new snapshot nobody asked
+  #     for).
+  # A matrix of zero entries is a legitimate outcome -- "the tag you pushed changes
+  # nothing" -- and the run says so in its log instead of failing or pretending.
+  #
+  # plan emits that JSON; release calls the reusable build workflow once per entry.
+  # fail-fast is off on purpose -- one series' build failure
   # must not cancel the healthy siblings that already have fixes to publish. Within one
   # leg, build-version.yml still covers cli + fpm on amd64 and arm64, so "one series"
   # is never "one image".
@@ -574,20 +727,38 @@ jobs:
   plan:
     needs: [guard, validate]
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 10
     outputs:
-      # JSON array, one object per selected series. `php` is the manifest's SOURCE_REF
-      # -- the PHP version the *configuration* says this series is, not a tag and not
-      # an input -- carried into the matrix so the run log names the versions being
-      # published, and `variants` so it names what each series will publish.
+      # JSON array, one object per series this run will actually publish. `php` is
+      # the manifest's SOURCE_REF -- the PHP version the *configuration* says this
+      # series is, not a tag and not an input -- `variants` is what each series will
+      # publish, and `revision` is the number the registry says is next. All three
+      # reach the run log through the matrix, because "what did this release do"
+      # should be answerable from the run that did it.
       matrix: ${{ steps.matrix.outputs.matrix }}
+      # A, B or C: which entry started the run, printed in the log and in the
+      # notice that a run which resolved to nothing published is honest about.
+      entry: ${{ needs.guard.outputs.entry }}
+      # How many legs the resolver left to publish -- zero is a real answer here.
+      legs: ${{ steps.matrix.outputs.legs }}
+      # The selection the resolver was asked about, in its own comma form. The
+      # mirror job reads the same registry later, after the matrix has published,
+      # and has to ask about the same series; recomposing that list from the
+      # guard's padded output is how two jobs come to mean two different things by
+      # "this run's scope".
+      scope: ${{ steps.matrix.outputs.scope }}
     steps:
       - uses: actions/checkout@v7
 
-      - name: Build the release matrix from the selected series
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Resolve versions, revisions and skips into the release matrix
         id: matrix
         env:
           SELECTED: ${{ needs.guard.outputs.selected }}
+          NAMESPACE: ${{ inputs.namespace || 'muffetlab' }}
+          ENTRY: ${{ needs.guard.outputs.entry }}
         run: |
           set -eu
           # ",5.6,7.0," -> the words 5.6 and 7.0. The comma padding leaves empty
@@ -598,38 +769,61 @@ jobs:
           set -- $(printf '%s' "$SELECTED" | tr ',' ' ')
           set +f
           # validate's readiness step already refused an empty selection, so this is
-          # the second lock: a matrix of zero entries would run no build job at all,
-          # every later job would read it as skipped, and the run would still look
-          # like a release that published nothing.
+          # the second lock: a matrix built from no series would run no build job at
+          # all, every later job would read it as skipped, and the run would still
+          # look like a release that published nothing. A *full* selection that
+          # resolves to no legs is a different thing -- see below -- and is reported,
+          # not refused.
           [ "$#" -gt 0 ] || {
             echo "::error::no PHP series was selected (guard emitted '${SELECTED:-<empty>}'); refusing to build an empty release matrix"
             exit 1
           }
-          json="["
-          first=1
-          for series in "$@"; do
-            # Read from the manifest rather than trusting the input, so the version in
-            # the published name has one source: the reviewed config.
-            php="$(sed -n 's/^SOURCE_REF="\(.*\)"/\1/p' "manifests/${series}.env")"
-            [ -n "$php" ] || {
-              echo "::error::manifests/${series}.env has no SOURCE_REF; the PHP version must come from the manifest, not from a tag or an input"
-              exit 1
-            }
-            variants="$(sed -n 's/^BUILD_VARIANTS="\(.*\)"/\1/p' "manifests/${series}.env")"
-            [ -n "$variants" ] || {
-              echo "::error::manifests/${series}.env declares no BUILD_VARIANTS"; exit 1
-            }
-            entry="$(printf '{"series":"%s","php":"%s","variants":"%s"}' "$series" "$php" "$variants")"
-            if [ "$first" = 1 ]; then
-              json="${json}${entry}"; first=0
-            else
-              json="${json},${entry}"
-            fi
-            echo "Release leg: PHP ${series} -> ${php} (${variants})"
-          done
-          json="${json}]"
-          printf 'matrix=%s\n' "$json" >> "$GITHUB_OUTPUT"
-          echo "Selected series: $* ($# of $(printf '%s' "$SUPPORTED_VERSIONS" | wc -w | tr -d ' ') supported)"
+          # The resolver's own comma-separated form, rebuilt from the words above
+          # rather than by deleting the padding from the guard's list: `tr -d ','`
+          # on ",8.1,5.6," yields "8.15.6", which is no series at all -- so the
+          # multi-series entry would have been refused by the resolver for a reason
+          # nothing in the log explains. Joining the split words puts commas where
+          # the guard's padding had none, and keeps guard, validate and plan
+          # speaking about the identical selection by construction.
+          scope="$(IFS=,; printf '%s' "$*")"
+          # First pass: read the live registry, print the verdict per series for the
+          # human reading the log, and capture exactly what was read.
+          if ! plan_report="$(./tools/release-plan.sh --scope "$scope" \
+              --namespace "$NAMESPACE" --state-out "$RUNNER_TEMP/release-state.json")"; then
+            printf '%s\n' "$plan_report"
+            echo "::error::the release plan could not be resolved for '${scope}'; nothing was built or published. A registry this step cannot read is not a reason to guess a revision"
+            exit 1
+          fi
+          printf '%s\n' "$plan_report"
+          # Second pass: the matrix, from the captured read rather than a fresh one.
+          # The two passes cannot then disagree -- the log and the legs are the same
+          # answer to the same question, asked once -- and the same
+          # --state-in/--state-out pair is what tests/release-plan-harness.sh asserts
+          # against fixtures, with no network.
+          if ! matrix="$(./tools/release-plan.sh --scope "$scope" \
+              --namespace "$NAMESPACE" --state-in "$RUNNER_TEMP/release-state.json" --json)"; then
+            printf '%s\n' "$matrix"
+            echo "::error::the captured release plan did not produce a matrix"
+            exit 1
+          fi
+          printf '%s\n' "$matrix" | jq -e 'type == "array"' >/dev/null || {
+            echo "::error::the release plan emitted something that is not a JSON array: $matrix"
+            exit 1; }
+          legs="$(printf '%s' "$matrix" | jq 'length')"
+          if [ "$legs" = 0 ]; then
+            # Nothing to build, and the reason is in the SKIP lines above: the
+            # registry already serves exactly these pins for every selected series.
+            # Publishing r2 anyway would be a snapshot of a build that changed
+            # nothing, under a floating name that would move to it.
+            echo "::notice::entry $ENTRY: every selected series (${scope}) is already published from these exact inputs, so this run builds and pushes nothing. The SKIP lines above name the pins that matched; a run that should publish anyway needs a manifest that moved."
+          else
+            printf '%s\n' "$matrix" |
+              jq -r '.[] | "Release leg: PHP \(.series) -> \(.php) at r\(.revision) (\(.variants)), verdict \(.mode)"'
+            echo "Selected series: $# selected, ${legs} to publish ($# of $(printf '%s' "$SUPPORTED_VERSIONS" | wc -w | tr -d ' ') supported)"
+          fi
+          printf 'matrix=%s\n' "$matrix" >> "$GITHUB_OUTPUT"
+          printf 'legs=%s\n' "$legs" >> "$GITHUB_OUTPUT"
+          printf 'scope=%s\n' "$scope" >> "$GITHUB_OUTPUT"
 
   release:
     needs: [guard, validate, plan]
@@ -646,20 +840,233 @@ jobs:
       version: ${{ matrix.series }}
       push: true
       # The image revision every published exact name carries
-      # (<php>-r<revision>-<variant>). It comes from the dispatch input rather than a
-      # tag, and every series in this run shares it -- which is what makes r2 one
-      # release of this kit instead of eight unrelated rebuilds.
-      revision: ${{ needs.guard.outputs.revision }}
+      # (<php>-r<revision>-<variant>) -- one per series, resolved from the registry
+      # by the plan step and arriving through the matrix, so two series on different
+      # PHP versions get the number each one's own names imply. It is not an input
+      # anyone types: that is what makes a full release idempotent and what keeps
+      # two runs from both claiming to be the first build of a version.
+      revision: ${{ matrix.revision }}
+      # The plan's verdict for this series at this revision, from the same
+      # registry read that picked the number. It says nothing about what to build
+      # and everything about what an already-served exact name means: `publish`
+      # promised a revision the registry has not served, so finding it there is a
+      # conflict and the leg refuses; `complete` promised the series is being
+      # finished at a revision it has partly served, so finding a variant there is
+      # that release being already published and the name is left alone. Defaults
+      # to the stricter of the two in the callee, so a leg that arrives without one
+      # cannot turn a collision into a silent skip.
+      mode: ${{ matrix.mode }}
       # The git tag of the source being published. The guard above required the
-      # dispatched commit to carry it, and build-version.yml refuses push=true without
+      # pushed tag -- or the dispatched commit's tag -- to be exactly that shape,
+      # and build-version.yml refuses push=true without
       # it, so publishing from untagged source is blocked at both ends of the call.
       source_release: ${{ needs.guard.outputs.release }}
       namespace: ${{ inputs.namespace || 'muffetlab' }}
-      attestations: ${{ inputs.attestations }}
+      # A dispatch's checkbox, or true when there was no form at all: entry A has
+      # nothing to ask, and a release that silently lost its attestations because
+      # an unset input read as false would be a worse surprise than a run that
+      # said which one it was.
+      attestations: ${{ inputs.attestations != false }}
     secrets:
       token: ${{ secrets.GITHUB_TOKEN }}
       dockerhub_username: ${{ secrets.DOCKERHUB_USERNAME }}
       dockerhub_token: ${{ secrets.DOCKERHUB_TOKEN }}
+
+  # The Docker Hub mirror, brought up to GHCR by copying. A mirror is not a second
+  # build: when GHCR already serves a name, the image the mirror is allowed to hold
+  # under it is GHCR's, because a PHP compile is not reproducible and this run's
+  # digests differ from a published one even when its pins match. So this job asks
+  # the resolver -- which reads GHCR and only GHCR -- for the names it verified as
+  # current, and copies exactly those, then points the mirror's floating names at
+  # them. What it never does is build, delete, or write an exact name the mirror
+  # already serves. The distinction that matters on the mirror is the one between
+  # a missing tag and an existing one: a missing tag is filled by copying, an
+  # existing tag is never widened or rewritten -- an incomplete copy and a
+  # snapshot of a different build are both refused, and the refusal names which
+  # of the two it found, because deleting the tag is a human's act on a service
+  # this pipeline is not granted, and after the deletion the same job re-syncs
+  # the name from GHCR whole. That repair moves no revision: the mirror is a
+  # repairable copy of the registry that records what was published, and a mirror
+  # that is missing, unreachable or wrong never moves a GHCR revision.
+  #
+  # It reads the registry afresh rather than reusing the plan job's capture, and
+  # that is the point: the matrix has published since that capture, so a repair
+  # planned from the capture would copy the state the release departed from. The
+  # scope is the plan's own, handed over as an output, so the two reads ask about
+  # the identical selection.
+  #
+  # This is what makes "GHCR succeeded, Docker Hub failed" a revision-neutral
+  # repair: the next run's plan finds the series current on GHCR, emits no leg at
+  # all, and the names still owed to the mirror are named here instead. That is
+  # also why the job runs whatever the matrix did -- a leg that failed on the
+  # mirror alone has left GHCR correct, which is precisely the case worth finishing.
+  mirror-repair:
+    needs: [guard, validate, plan]
+    # Deliberately not `needs: [release]`: a matrix that failed on the mirror
+    # still published GHCR, and a matrix that resolved to nothing published
+    # nothing at all -- in both cases the mirror is the part that can still be
+    # brought up to the registry the plan reads. `!cancelled()` rather than
+    # `always()` because a run somebody stopped is not a run that should be
+    # writing a registry behind them.
+    if: ${{ !cancelled() && needs.guard.result == 'success' && needs.validate.result == 'success' && needs.plan.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Docker Hub (optional mirror)
+        if: env.DOCKERHUB_USERNAME != ''
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        uses: docker/login-action@v4
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Copy what GHCR serves correctly to the Docker Hub mirror
+        env:
+          SCOPE: ${{ needs.plan.outputs.scope }}
+          NAMESPACE: ${{ inputs.namespace || 'muffetlab' }}
+          ENTRY: ${{ needs.guard.outputs.entry }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          set -eu
+          if [ -z "${DOCKERHUB_USERNAME:-}" ]; then
+            echo "No Docker Hub mirror secrets on this repository, so there is no <user>/php repository to bring up to GHCR and nothing here was skipped by accident. GHCR itself is unaffected: the names this job would have copied are published there by the matrix."
+            exit 0
+          fi
+          primary="ghcr.io/${NAMESPACE}/php"
+          mirror="${DOCKERHUB_USERNAME}/php"
+          # The list is the resolver's answer, not a list this step composes. It
+          # already knows which names it read, compared with the manifest, and
+          # found equal on both variants and every architecture, and it spells the
+          # exact and floating names -- composing them a second way here is how a
+          # mirror ends up pointed at a name the plan never checked.
+          if ! repair_json="$(./tools/release-plan.sh --scope "$SCOPE" \
+              --namespace "$NAMESPACE" --repair)"; then
+            printf '%s\n' "$repair_json"
+            echo "::error::the release plan could not be read for the mirror repair of '${SCOPE}'; nothing was copied. A registry this step cannot read is not a reason to guess at a mirror"
+            exit 1
+          fi
+          printf '%s\n' "$repair_json" | jq -e 'type == "array"' >/dev/null || {
+            echo "::error::the repair list is not a JSON array: $repair_json"
+            exit 1; }
+          count="$(printf '%s' "$repair_json" | jq 'length')"
+          if [ "$count" = 0 ]; then
+            echo "::notice::entry $ENTRY (${SCOPE}): the primary served no name this run could verify as current, so the mirror has nothing it is allowed to copy. This is not a claim that the mirror is correct -- an unverified name is not a name to copy -- and a mirror that is wrong in that state stays wrong until the primary publishes something the plan has checked."
+            exit 0
+          fi
+          # What a name *is*, reduced to what a puller resolves: one
+          # "os/arch child-digest" line per real platform, sorted. Attestation
+          # entries are dropped because buildx attaches provenance and SBOM
+          # manifests with a platform of unknown/unknown, they are not
+          # architectures, and GitHub's attestation storage does not exist on the
+          # mirror -- comparing them would call every copied image a difference. A
+          # tag that is a single manifest rather than a list is named as one, so
+          # the two shapes cannot read as equal to each other.
+          content_of() { # <raw-manifest-json>
+            printf '%s' "$1" | jq -r '
+              if (.manifests | type) == "array" then
+                ([.manifests[]? | select(.platform != null)
+                  | select((.platform.architecture // "unknown") != "unknown")
+                  | "\(.platform.os)/\(.platform.architecture) \(.digest)"] | sort | join("\n"))
+              else "single \(.config.digest // "unreadable")" end'
+          }
+          copied=0
+          equal=0
+          incomplete=0
+          foreign_count=0
+          failed=0
+          while IFS=$'\t' read -r series variant exact floating; do
+            [ -n "$exact" ] || continue
+            echo "Repair: ${series} ${variant} -> ${exact} (floating ${floating})"
+            # Read the primary first, and read it live: this job runs after the
+            # matrix, so a name the plan called next may be one the matrix
+            # published since. Nothing is copied from a source this step cannot
+            # read now.
+            if ! praw="$(docker buildx imagetools inspect --raw "${primary}:${exact}" 2>&1)"; then
+              printf '%s\n' "$praw" | tail -n 3
+              echo "::error::${primary}:${exact} is on the repair list but the primary no longer serves it, so nothing was copied for it"
+              failed=$((failed + 1))
+              continue
+            fi
+            want="$(content_of "$praw")"
+            if mraw="$(docker buildx imagetools inspect --raw "${mirror}:${exact}" 2>&1)"; then
+              have="$(content_of "$mraw")"
+              # A name that exists but differs is two facts, not one, and the
+              # boundary between them decides nothing about the revision but
+              # everything about the words this job says: a mirror holding a
+              # child GHCR does not serve carries a different build, while a
+              # mirror holding only a subset of GHCR's platforms holds an
+              # incomplete copy of this one. Both are refused -- an existing
+              # tag is not patched in place and an exact published name is
+              # never rewritten, on either registry -- but the human deleting
+              # the tag should be told which of the two they are deleting.
+              # comm reads the two sorted line sets directly: lines only in the
+              # mirror's content are foreign, lines only in the primary's are
+              # what the copy is missing.
+              foreign="$(comm -23 <(printf '%s\n' "$have") <(printf '%s\n' "$want") | sed '/^$/d')"
+              owed="$(comm -13 <(printf '%s\n' "$have") <(printf '%s\n' "$want") | sed '/^$/d')"
+              if [ -n "$foreign" ]; then
+                echo "::error::${mirror}:${exact} already exists and carries images ${primary}:${exact} does not -- GHCR has [$(printf '%s' "$want" | tr '\n' ';')], the mirror has [$(printf '%s' "$have" | tr '\n' ';')]. Nothing was written. An exact published name is never rewritten, so the mirror's snapshot stays as it is, and the plan will not publish beside it either, because GHCR is the registry the plan reads and GHCR is correct. This is the one gap a release run cannot close: delete ${mirror}:${exact} in Docker Hub's package settings, then re-run the same scope -- the next pass finds the name free and copies GHCR's into it. That is a repair of the mirror, not a rebuild, and it moves no revision."
+                foreign_count=$((foreign_count + 1))
+                continue
+              fi
+              if [ -n "$owed" ]; then
+                echo "::error::${mirror}:${exact} exists but is an incomplete copy of ${primary}:${exact} -- the mirror is missing [$(printf '%s' "$owed" | tr '\n' ';')]. Nothing was written: an existing tag is not patched in place, and rewriting the name to a wider list is the same act as rewriting it to a different image. Delete ${mirror}:${exact} in Docker Hub's package settings, then re-run the same scope -- the next pass finds the name free and re-syncs it from GHCR whole. That is a repair of the mirror, not a rebuild, and it moves no revision."
+                incomplete=$((incomplete + 1))
+                continue
+              fi
+              echo "Verified ${mirror}:${exact} carries the same images as ${primary}:${exact}; nothing was written for that name."
+              equal=$((equal + 1))
+            else
+              if ! out="$(docker buildx imagetools create -t "${mirror}:${exact}" "${primary}:${exact}" 2>&1)"; then
+                printf '%s\n' "$out" | tail -n 3
+                echo "::error::could not copy ${primary}:${exact} to ${mirror}:${exact}: $(printf '%s\n' "$out" | tail -n 3 | tr '\n' ' ')"
+                failed=$((failed + 1))
+                continue
+              fi
+              echo "Copied ${primary}:${exact} to ${mirror}:${exact} -- no build and no re-tag of this run's digests: the mirror took GHCR's image."
+              copied=$((copied + 1))
+            fi
+            # The floating name is the moving one, so it is checked against the
+            # exact name rather than remembered: a mirror whose snapshot is right
+            # and whose <minor>-<variant> still points one revision back is a
+            # mirror that reads stale to everyone who does not pin.
+            if fraw="$(docker buildx imagetools inspect --raw "${mirror}:${floating}" 2>&1)" &&
+              [ "$(content_of "$fraw")" = "$want" ]; then
+              echo "${mirror}:${floating} already resolves to it."
+            elif ! out="$(docker buildx imagetools create -t "${mirror}:${floating}" "${mirror}:${exact}" 2>&1)"; then
+              printf '%s\n' "$out" | tail -n 3
+              echo "::error::could not point ${mirror}:${floating} at ${mirror}:${exact}: $(printf '%s\n' "$out" | tail -n 3 | tr '\n' ' ')"
+              failed=$((failed + 1))
+            else
+              echo "Pointed ${mirror}:${floating} at ${mirror}:${exact}."
+            fi
+          done < <(printf '%s' "$repair_json" | jq -r '.[] | [.series, .variant, .exact, .floating] | @tsv')
+          printf 'mirror-repair: %d copied from %s, %d already equal, %d incomplete copies, %d carrying images GHCR does not, %d failures\n' \
+            "$copied" "$primary" "$equal" "$incomplete" "$foreign_count" "$failed"
+          if [ "$incomplete" != 0 ] || [ "$foreign_count" != 0 ] || [ "$failed" != 0 ]; then
+            echo "::error::the mirror is not up to ${primary}: ${incomplete} exact name(s) are incomplete copies, ${foreign_count} carry images GHCR does not, and ${failed} name(s) could not be read or written. The images GHCR serves are unaffected, and no revision moved; the lines above name which tag needs which hand"
+            exit 1
+          fi
 
   # The Docker Hub mirror's Overview, once per release run. It is one document for the
   # whole <user>/php repository rather than one per series, so it cannot live in the
@@ -671,9 +1078,10 @@ jobs:
   # A README-only change still goes through tools/sync-dockerhub-readme.yml, which
   # exists so the Overview can be re-synced without republishing an image.
   mirror-readme:
-    needs: [guard, release]
-    # Only after a release that actually published: a failed or skipped matrix must not
-    # advertise a half-published set of images.
+    needs: [guard, plan, release]
+    # Only after a release that actually published: a failed matrix must not
+    # advertise a half-published set of images, and a run whose plan resolved to
+    # nothing published nothing, so its Overview is already current.
     if: ${{ needs.release.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -691,7 +1099,8 @@ jobs:
           DOCKERHUB_USERNAME: ${{ secrets.dockerhub_username }}
           DOCKERHUB_TOKEN: ${{ secrets.dockerhub_token }}
           RELEASE: ${{ needs.guard.outputs.release }}
-          REVISION: ${{ needs.guard.outputs.revision }}
+          ENTRY: ${{ needs.guard.outputs.entry }}
+          LEGS: ${{ needs.plan.outputs.legs }}
         run: |
           set -eu
           # The mirror test is in the shell, not the "if:", on purpose. GitHub does not
@@ -701,10 +1110,10 @@ jobs:
           # answer as "no mirror configured". Saying which of the two happened is worth
           # a line of output, and the line below is only reached with both set.
           if [ -z "${DOCKERHUB_USERNAME:-}" ] || [ -z "${DOCKERHUB_TOKEN:-}" ]; then
-            echo "No Docker Hub mirror secrets on this repository, so there is no <user>/php repository to write an Overview for, and nothing here was skipped by accident. ${RELEASE} published to GHCR only, as revision r${REVISION}."
+            echo "No Docker Hub mirror secrets on this repository, so there is no <user>/php repository to write an Overview for, and nothing here was skipped by accident. ${RELEASE} published ${LEGS} series to GHCR only, each at the revision the registry said was next for its PHP version."
             exit 0
           fi
-          echo "One Overview call for the whole release run (${RELEASE}, image revision r${REVISION}); this is that call."
+          echo "One Overview call for the whole release run (entry ${ENTRY}, source release ${RELEASE}, ${LEGS} series published); this is that call."
           ./tools/sync-dockerhub-readme.sh
 
   # GHCR packages are created private on first push. GITHUB_TOKEN cannot

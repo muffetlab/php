@@ -95,8 +95,8 @@ private channel if the fix is not yet public. The expected maintainer flow:
    are never moved, so the build you reported keeps its own name and digest while
    the floating `8.1-fpm` moves to the fixed one: a deployment that pinned the minor
    tag receives the fix without editing anything, and one that pinned
-   `8.1.34-r1-fpm` has to move to `8.1.34-r2-fpm`. Which revision a fix ships under,
-   and how the run that publishes it is dispatched, is
+   `8.1.34-r1-fpm` has to move to `8.1.34-r2-fpm`. How the next revision is worked
+   out, and how the run that publishes it is started, is
    [MAINTAINING.md](MAINTAINING.md) ("Publishing images").
 
 ## OS package CVEs (the Debian base)
@@ -194,7 +194,7 @@ claim the pipeline does not enforce, and a new gate cannot ship unclaimed.
 | The base cannot disagree with the OpenSSL route | A wrong base fails the build rather than shipping PHP linked against a library nobody declared. | *Hardening gates* |
 | Nothing is published that failed verify-build or verify-runtime | Every promised extension is present, loadable and linked as declared, and the provenance inside the image is there — as build preconditions, not post-release hopes. | *Build & verification order* |
 | Per-version behaviour is enumerated or CI fails | A rule that applies to one series only is documented in the maintainer inventory or the build is refused, so per-version divergence cannot accumulate silently. | *Version-conditional behaviour* |
-| No pull request or branch push can reach a registry | Review is not a path to publishing an image: only a human dispatching the release workflow from the default branch is. | *CI (GitHub Actions)* |
+| No pull request or branch push can reach a registry | Review is not a path to publishing an image: the only paths are a human act — pushing a tag that marks a source release, or starting the release workflow from the default branch — and neither a pull request nor a branch push counts as one. | *CI (GitHub Actions)* |
 | Publishing requires tagged source | Every published image comes from a commit marked as a source release, and a git tag is never a PHP version or an image revision. | *Publishing images* |
 | The Hub token writes documentation text only | The one secret with a scope wider than a registry login changes the mirror repository's `full_description` and nothing else: it cannot move, sign or delete an image tag, and it is never used for a pull request or a fork. | *The Docker Hub mirror's Overview* |
 | Every published image carries its provenance | What an image is made of is checkable where it runs: `/opt/php/BUILD-PROVENANCE`, matching OCI labels, and attestations attached to the released manifest list. | *Publishing images* |

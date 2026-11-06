@@ -10,16 +10,20 @@ name: build-version
 # unfilled template — the review gates (PATCHSET_APPROVED=1, digest pin,
 # commit pin) are human decisions and CI must not bypass them.
 #
-# Push mode (push=true) is set only by release.yml, and honored only from the
-# default branch (refs/heads/main or refs/heads/master) -- which is where a
-# workflow_dispatch of release.yml always runs. Two more things make a push
-# legitimate, and both are checked here rather than assumed:
+# Push mode (push=true) is set only by release.yml, and honored only from a ref
+# that a human chose to release from: the default branch (refs/heads/main or
+# refs/heads/master), which is where a workflow_dispatch of release.yml runs, or a
+# conforming source release tag ref (refs/tags/vMAJOR.MINOR.PATCH), which is what a
+# tag push of release.yml runs on. Nothing else reaches a registry: no pull request,
+# no branch push, no tag whose name is not exactly a source release version. Two
+# more things make a push legitimate, and both are checked here rather than assumed:
 #   - source_release names the git tag of the source being published
-#     (vMAJOR.MINOR.PATCH). A git tag marks a *source release*; it does not select
-#     a PHP version or a build number, and nothing about a published image name
-#     comes from a tag name. release.yml's guard requires the dispatched commit to
-#     carry such a tag and fails closed when it does not, so an image can never be
-#     published from untagged source; this workflow restates the rule at the one
+#     (vMAJOR.MINOR.PATCH). A git tag marks a *source release*; it selects no PHP
+#     version and contributes nothing to an image name, so the same tag can cover a
+#     release of every series. release.yml's guard requires the branch commit it
+#     dispatched from to carry such a tag -- or the pushed tag to be one -- and
+#     fails closed when it does not, so an image can never be published from
+#     untagged source; this workflow restates the rule at the one
 #     place that actually writes to a registry.
 #   - inputs.revision is the image revision, a positive integer, and it always
 #     appears in the immutable name (<php>-r<revision>-<variant>). An OS security
@@ -39,10 +43,17 @@ name: build-version
 #     user/org) rather than editing this file.
 #   - tags: <registry>/<namespace>/php:<full-php-version>-r<revision>-<variant>
 #           <registry>/<namespace>/php:<minor>-<variant>   (floating)
-#           The PHP version comes from the manifest (SOURCE_REF), the revision from
-#           the release input -- never from a git tag name. The exact name is a
+#           The PHP version comes from the manifest (SOURCE_REF) and the revision
+#           from the registry (release.yml's plan step, tools/release-plan.sh) --
+#           never from a git tag name. The exact name is a
 #           snapshot: 8.1.34-r1-cli is that build forever, and the next fix is
 #           published beside it as 8.1.34-r2-cli. Only <minor>-<variant> moves.
+#           The step below never rewrites an exact name; what inputs.mode decides
+#           is what finding one already there means -- a refused leg (publish: the
+#           plan read the registry and said this revision was new, so the registry
+#           moved under the run) or the release being already half-published
+#           (complete: the plan read the registry, saw this variant current at this
+#           revision, and sent the series to be finished at it).
 #           No :latest-<variant>, and no plain :latest either. A release run
 #           publishes the series it selects, so "latest" would name whichever series
 #           someone released last -- not the newest PHP and not a recommendation, and an
@@ -92,20 +103,49 @@ on:
         required: true
         type: string
       # The image revision: the r<N> that appears in the immutable published name
-      # (php:<full>-r<N>-<variant>). It comes from release.yml's dispatch input, not
-      # from a git tag, and it is mandatory -- every published exact name is a
-      # revision, so "the first build" and "the first unrevised build" are the same
-      # thing (r1) and there is no bare <full>-<variant> name for a later build to
+      # (php:<full>-r<N>-<variant>). It comes from release.yml's plan step, which
+      # derives it per PHP point version by reading the exact names already
+      # published in the registry -- not from a dispatch input and not from a git
+      # tag. It is mandatory in push mode because every published exact name is a
+      # revision: "the first build" and "the first unrevised build" are the same
+      # thing (r1), and there is no bare <full>-<variant> name for a later build to
       # overwrite. An OS security update that does not move the PHP version moves
       # this number instead, and the previous image stays pullable by name.
+      # The default is empty rather than "1" on purpose: a caller that forgets to
+      # say which revision it is publishing gets a refused push instead of a
+      # second image claiming to be the first build of that version.
       revision:
         required: false
         type: string
-        default: "1"
+        default: ""
+      # What the plan step's verdict said about this revision. It changes nothing
+      # about what is built or what is published -- it changes what finding an
+      # exact name already in the registry means:
+      #   publish  -- the plan read the primary registry and proposed a revision it
+      #               found nothing at, so a name already there means the registry
+      #               moved under this run (a re-run without the concurrency group,
+      #               a manual push). Refusing is not caution for its own sake: the
+      #               series' other variant would otherwise be published beside that
+      #               name, giving one revision number two pinsets;
+      #   complete -- the plan found this variant already current at the newest
+      #               revision and sent the series to be finished at that revision,
+      #               so a name already there is this release being already
+      #               published: the snapshot is left untouched and the half that is
+      #               missing is what gets written.
+      # A mirror registry (Docker Hub) is never read by the plan, so a name already
+      # there is always the residue of a run that published elsewhere and failed
+      # here, and is skipped on that registry while the others are published.
+      # Default is the stricter of the two, so a caller that says nothing cannot
+      # turn a collision into a silent skip.
+      mode:
+        required: false
+        type: string
+        default: publish
       # The git tag of the source being published (vMAJOR.MINOR.PATCH). A git tag
       # marks a source release; it selects no PHP version and contributes nothing to
-      # an image name. release.yml's guard requires the dispatched commit to carry
-      # one, and passes it here so the requirement is checked again at the point
+      # an image name. release.yml's guard requires either the dispatched commit to
+      # carry one or the pushed ref to be one, and passes it here so the requirement
+      # is checked again at the point
       # where a registry is written and recorded on the image as
       # dev.php-legacy.source-release. Test-mode callers (build-and-verify.yml) have
       # no release tag, and the label says "untagged" for them.
@@ -347,13 +387,15 @@ jobs:
             } >> "$GITHUB_ENV"
           fi
 
-      # Push mode is only allowed from the default branch, which is where a
-      # workflow_dispatch of release.yml runs. PRs and forks can never publish,
-      # regardless of how the workflow was triggered. A push also requires
-      # source_release, the git tag of the source being published: tags mark source
-      # releases and select nothing else, so publishing from an untagged commit is
-      # refused here as well as by release.yml's guard, because this is the last
-      # check before an image leaves the building.
+      # Push mode is allowed from two refs and no others: the default branch, which
+      # is where a workflow_dispatch of release.yml runs, and a conforming source
+      # release tag ref, which is where a tag push of release.yml runs. A pull
+      # request, a push to any branch, and a push of a tag whose name is not exactly
+      # vMAJOR.MINOR.PATCH can never publish, whatever the caller asked for. A push
+      # also requires source_release, the git tag of the source being published:
+      # tags mark source releases and select nothing else, so publishing from an
+      # untagged commit is refused here as well as by release.yml's guard, because
+      # this is the last check before an image leaves the building.
       - name: Determine push mode
         # Deliberately not gated on the manifest state: this value depends only
         # on the ref and the caller, so every matrix leg computes the same answer
@@ -363,19 +405,26 @@ jobs:
           SOURCE_RELEASE: ${{ inputs.source_release }}
           PUSH: ${{ inputs.push }}
           REVISION: ${{ inputs.revision }}
+          MODE: ${{ inputs.mode }}
+          REF: ${{ github.ref }}
         run: |
           set -eu
-          case "${{ github.ref }}" in
-            refs/heads/main|refs/heads/master) allowed=1 ;;
-            *) allowed=0 ;;
+          refkind=other
+          tagname=""
+          case "$REF" in
+            refs/heads/main | refs/heads/master) refkind=branch ;;
+            refs/tags/*)
+              refkind=tag
+              tagname="${REF#refs/tags/}"
+              ;;
           esac
           if [ "$PUSH" = "true" ]; then
             # A publishing caller on a ref it may not publish from is a
             # misconfiguration, not a skip: silently reporting push=false here
             # would let every leg skip its by-digest push, skip the merge job,
             # and still colour the release green having published nothing.
-            if [ "$allowed" != 1 ]; then
-              echo "::error::push=true but ${{ github.ref }} may not publish (only refs/heads/main or refs/heads/master, from release.yml's dispatch on the default branch)"
+            if [ "$refkind" = other ]; then
+              echo "::error::push=true but $REF may not publish (only refs/heads/main, refs/heads/master, or a vMAJOR.MINOR.PATCH tag -- from release.yml's dispatch on the default branch or its tag trigger)"
               exit 1
             fi
             # The tag selects no PHP version and no image revision -- it says which
@@ -385,13 +434,33 @@ jobs:
               echo "::error::push=true but source_release='$SOURCE_RELEASE' is not a source release tag (expected vMAJOR.MINOR.PATCH); refusing to publish an image whose source commit is not a tagged release"
               exit 1
             fi
-            echo "Publishing from tagged source release $SOURCE_RELEASE"
+            # On the tag entry the ref and the declared source are the same object,
+            # so a caller that published "from v1.0.0" while running on v2.0.0 is
+            # refused rather than believed. On the branch entry the source tag is
+            # read off the commit by release.yml's guard, so there is no ref name to
+            # agree with.
+            if [ "$refkind" = tag ] && [ "$tagname" != "$SOURCE_RELEASE" ]; then
+              echo "::error::push=true on tag $tagname but source_release says $SOURCE_RELEASE; a tag-triggered release publishes the source its own ref names"
+              exit 1
+            fi
+            # The verdict decides what an already-published exact name means, so a
+            # value outside the two it can take is refused here rather than read as
+            # one of them by whichever step happens to compare against it. An empty
+            # one is not a default: the input's default is publish, so an empty
+            # value means a caller composed the string itself.
+            if [ "$MODE" != publish ] && [ "$MODE" != complete ]; then
+              echo "::error::push=true but mode='$MODE' is not a release verdict (publish | complete). publish refuses a revision the registry has served; complete finishes one it has partly served -- see tools/release-plan.sh"
+              exit 1
+            fi
+            echo "Publishing from tagged source release $SOURCE_RELEASE ($refkind ref), verdict: $MODE"
             # Every published exact name carries the revision, so a push with an
             # empty or malformed one would produce a name no later build can reason
             # about (and, in the old bare form, one a rebuild would overwrite).
-            # Checked again where the name is composed.
+            # The number is derived from the registry by release.yml's plan step;
+            # this is where a caller that passed none at all is refused, because the
+            # input's empty default would otherwise compose "...-r--cli".
             if ! printf '%s' "$REVISION" | grep -Eq '^[1-9][0-9]*$'; then
-              echo "::error::push=true but revision='$REVISION' is not an image revision (expected a positive integer such as 1; the published name is <php>-r<N>-<variant>); refusing to publish an unnamed build"
+              echo "::error::push=true but revision='$REVISION' is not an image revision (expected a positive integer such as 1; the published name is <php>-r<N>-<variant>). release.yml's plan step derives it from the exact names already in the registry -- see tools/release-plan.sh"
               exit 1
             fi
             echo "push=true" >> "$GITHUB_OUTPUT"
@@ -761,6 +830,7 @@ jobs:
           VERSION: ${{ inputs.version }}
           VARIANT: ${{ matrix.variant }}
           REVISION: ${{ inputs.revision }}
+          MODE: ${{ inputs.mode }}
           DOCKERHUB_USER: ${{ secrets.dockerhub_username }}
         run: |
           set -eu
@@ -789,6 +859,7 @@ jobs:
           # tools/check-image-name.sh reads it back out of this workflow and
           # holds the docs to it.
           repos="${REGISTRY}/${NAMESPACE}/php"
+          primary_repo="${REGISTRY}/${NAMESPACE}/php"
           if [ -n "${DOCKERHUB_USER}" ]; then repos="${repos} ${DOCKERHUB_USER}/php"; fi
           # There is deliberately no tag-derived check left in this step: a git tag
           # marks the source release and says nothing about which PHP series this
@@ -801,8 +872,8 @@ jobs:
           # and driver are the first things to suspect when a publish fails, so the
           # step records them.
           docker buildx version
-          publish_one() { # <registry/repo> -- one manifest list per registry
-            local repo="$1" tags="" out exact
+          publish_one() { # <registry/repo> <primary|mirror> -- one list per registry
+            local repo="$1" role="$2" tags="" out exact taken copied_from
             # Fully-qualified tag: the exact PHP version from the manifest's
             # SOURCE_REF (via the built image's own version), then this run's image
             # revision, then the variant. 8.1.34-r1-cli is that build forever; the
@@ -813,7 +884,79 @@ jobs:
             # not in the name; read it from BUILD-PROVENANCE or the OCI label if it
             # matters.
             exact="${full}-r${REVISION}-${VARIANT}"
+            # An exact name is written once, so ask the registry whether this very
+            # name is already taken before asking it to take it. What a "yes" means
+            # depends on the verdict this leg was handed and on which registry is
+            # answering, and the three cases are not variations of one another:
+            #   primary + publish -- the plan read THIS registry and proposed a
+            #     revision it found nothing at, so a name here is the registry having
+            #     moved under the run. Refusing is what keeps one revision number
+            #     meaning one reviewed build: publishing this series' other variant
+            #     beside that name would put two pinsets under one r<N>.
+            #   primary + complete -- the plan read THIS registry, found this variant
+            #     already current at this revision and sent the series to be finished
+            #     at it. So this name is not a collision, it is this release being
+            #     already published: the snapshot is left exactly as it is and the
+            #     floating name is re-pointed at it, which costs nothing and restores
+            #     the one invariant a revision has (<minor>-<variant> is the newest
+            #     revisioned build). What is NOT done is writing this leg's freshly
+            #     built digests under that name -- a PHP compile is not reproducible,
+            #     so a retry's digests differ from the published ones even when its
+            #     pins do not, and the published ones are the release.
+            #   mirror, name taken -- the plan never reads the mirror, so a name
+            #     there can only be the residue of a run that published to the
+            #     primary registry and failed here. Skipping the registry that
+            #     already has it, and publishing the ones that do not, is what lets a
+            #     retry finish a release instead of being refused by the half that
+            #     succeeded. The mirror's own floating name was written by the same
+            #     call as its snapshot, so there is nothing here to restore.
+            #   mirror, name free but the primary serves it -- this is not this
+            #     run's build to make. The copy branch below takes the primary's
+            #     name as it stands, so the mirror never comes to hold a different
+            #     image under a snapshot the primary already published.
+            if taken="$(docker buildx imagetools inspect "${repo}:${exact}" 2>&1)"; then
+              printf '%s\n' "$taken" | sed -n '1,4p'
+              if [ "$role" = mirror ]; then
+                echo "Skipped ${repo}:${exact}: the mirror already serves this snapshot, so this registry has nothing to publish. Continuing with the registries that do."
+                return 0
+              fi
+              if [ "$MODE" = complete ]; then
+                if ! out="$(docker buildx imagetools create -t "${repo}:${VERSION}-${VARIANT}" "${repo}:${exact}" 2>&1)"; then
+                  printf '%s\n' "$out"
+                  echo "::error::could not re-point ${repo}:${VERSION}-${VARIANT} at the already-published ${repo}:${exact}: $(printf '%s\n' "$out" | tail -n 3 | tr '\n' ' ')"
+                  return 1
+                fi
+                echo "Reused ${repo}:${exact} as published (an exact name is never rewritten) and re-pointed ${repo}:${VERSION}-${VARIANT} at it -- this leg completed the revision instead of adding to it"
+                return 0
+              fi
+              echo "::error::${repo}:${exact} already exists, and an exact published name is never rewritten. This leg was handed a publish verdict, which promised a revision the registry does not serve, so either the registry moved under the run or the verdict arrived wrong -- and re-running this leg cannot fix either, because the same name is still there. The next release run reads the registry and either moves to the next revision or completes what is already served"
+              return 1
+            fi
             tags="-t ${repo}:${exact}"
+            # A mirror is a copy, and it is a copy of the primary registry rather
+            # than a second place that builds the same thing. So before this
+            # registry takes this run's freshly built digests under a name, ask
+            # the primary whether it already serves that name -- because when it
+            # does, those digests are the release, and a PHP compile is not
+            # reproducible: this run's amd64 layer differs from the published one
+            # even when every pin matches, and writing it here would give one
+            # exact name two contents, which is the thing the revision exists to
+            # prevent. imagetools create between registries moves the manifests
+            # and blobs as they are, so the mirror ends up byte-identical to the
+            # primary without building anything again -- and the floating name
+            # moves to the same image on both.
+            if [ "$role" = mirror ] &&
+              copied_from="$(docker buildx imagetools inspect "${primary_repo}:${exact}" 2>&1)"; then
+              printf '%s\n' "$copied_from" | sed -n '1,4p'
+              if ! out="$(docker buildx imagetools create -t "${repo}:${exact}" \
+                -t "${repo}:${VERSION}-${VARIANT}" "${primary_repo}:${exact}" 2>&1)"; then
+                printf '%s\n' "$out"
+                echo "::error::could not copy ${primary_repo}:${exact} to ${repo}:${exact}: $(printf '%s\n' "$out" | tail -n 3 | tr '\n' ' ')"
+                return 1
+              fi
+              echo "Copied ${primary_repo}:${exact} to ${repo}:${exact} and pointed ${repo}:${VERSION}-${VARIANT} at it -- the primary already served this snapshot, so the mirror took it from there instead of from this run's digests"
+              return 0
+            fi
             # Floating convenience tag for the minor series. It is the only moving
             # name this pipeline writes, it always moves to the build published
             # here, and by construction it cannot change the major version. There
@@ -834,9 +977,12 @@ jobs:
           # One imagetools call per registry, primary first: a single call carrying
           # both registries loses the GHCR tags if the mirror refuses, and its error
           # cannot say which registry is at fault. The mirror still fails the job --
-          # half a release is not a release -- but only after GHCR is published.
+          # half a release is not a release -- but only after GHCR is published. The
+          # role travels with it because "this name already exists" is a refusal on
+          # the registry the plan read and a skip on one it did not.
           for r in $repos; do
-            publish_one "$r"
+            if [ "$r" = "${REGISTRY}/${NAMESPACE}/php" ]; then role=primary; else role=mirror; fi
+            publish_one "$r" "$role"
           done
 
       - name: Verify the manifest list covers both architectures

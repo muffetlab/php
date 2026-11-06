@@ -37,6 +37,7 @@ cd "$root"
 
 build_wf=".github/workflows/build-version.yml"
 release_wf=".github/workflows/release.yml"
+plan_tool="tools/release-plan.sh"
 docs="README.md DEPLOYING.md MAINTAINING.md SUPPORTED.md docker-compose.example.yml docker-php-ext/README.md"
 
 fail=0
@@ -130,23 +131,53 @@ if ! grep -Fq "${local_repo}:<version>-<variant>-test" MAINTAINING.md; then
   err "MAINTAINING.md: does not document the local build tag ${local_repo}:<version>-<variant>-test"
 fi
 
-# Release naming model. Four version-shaped things, four separate jobs: a git tag
-# marks a source release (vMAJOR.MINOR.PATCH), the workflow_dispatch input picks
-# the scope (one series or all), manifests/<series>.env holds the PHP version, and
-# the Docker tag names the image that came out (<minor>-<variant> floating,
-# <full>-r<revision>-<variant> immutable). The assertions below are what keeps that
-# division from sliding back: a tag push trigger or a build number inside a tag
-# would put "which PHP version" and "which build" into the git ref again, which is
-# the coupling that made a full release cost eight tags.
-
-# release.yml is dispatch-only. A tag listener would have to parse the ref to know
-# what to build, and the only thing a ref can say is a version.
-if grep -Eq '^  push:' "$release_wf"; then
-  err "${release_wf}: has a push: trigger again; the scope of a release is a workflow_dispatch input, not a git tag -- a tag trigger puts PHP version selection back into refs/tags (see MAINTAINING.md 'Publishing images')"
+# Release naming model. Five version-shaped things, five separate jobs: a git tag
+# marks a source release (vMAJOR.MINOR.PATCH), the entry picks the scope (a tag
+# push names every supported series, a dispatch names one, a list, or all),
+# manifests/<series>.env holds the PHP version, the registry holds the image
+# revision, and the Docker tag names the image that came out (<minor>-<variant>
+# floating, <full>-r<revision>-<variant> immutable). The assertions below are what
+# keeps that division from sliding back: what a tag must never decide again is
+# *which PHP version* and *which build* -- that was the coupling that made a full
+# release cost eight tags, and a tag trigger is only safe here because the tag
+# names this repository's source and nothing else.
+#
+# Three entries, one pipeline: A pushes a conforming tag and publishes every
+# supported series, B dispatches one series, C dispatches several or all. All
+# three run the same guard, the same validate gate, the same resolver and the same
+# matrix, so "which version, which revision, publish, complete or skip" is
+# answered once per run wherever it was asked from -- and the answer is three
+# verdicts rather than two, because a release can fail after publishing one of a
+# series' two variants, which is a different situation from a pin that moved and
+# gets a different revision because of it.
+if ! grep -Eq '^  push:' "$release_wf"; then
+  err "${release_wf}: has no tag push trigger; entry A -- a conforming vMAJOR.MINOR.PATCH publishing every supported series -- is one of the three documented release entries (see MAINTAINING.md 'Publishing images')"
 fi
 if ! grep -Eq '^  workflow_dispatch:' "$release_wf"; then
-  err "${release_wf}: has no workflow_dispatch trigger; this is the only release entry point"
+  err "${release_wf}: has no workflow_dispatch trigger; entries B and C (one series, a list, or all) are how a targeted or batch release is started"
 fi
+# GitHub's tag filter is a glob, not a regex, so `v*.*.*` is the closest thing to
+# the shape that is writable here, and it therefore also matches v1.0.0-rc1. What
+# decides is the guard's own check -- asserted below by the literal it prints --
+# because a filter that cannot say "digits only" must not be mistaken for the
+# gate. A broader glob (v*) would start a run for every tag in the repository,
+# and no glob at all would start one for refs/tags that name nothing.
+if ! grep -Fq -- "- 'v*.*.*'" "$release_wf"; then
+  err "${release_wf}: the tag trigger no longer filters on 'v*.*.*' -- the widest honest glob, and the reason the guard has to check the shape itself"
+fi
+# A tag-triggered run has no form, so nothing it publishes may depend on a value
+# nobody typed: the scope for that entry is said in the workflow, not defaulted
+# from an empty input.
+# shellcheck disable=SC2016
+if ! grep -Fq -- 'if [ "$EVENT" = push ]; then' "$release_wf"; then
+  err "${release_wf}: the guard no longer branches on the event, so a tag-triggered run would take its scope from a dispatch input that does not exist"
+fi
+# The three labels are the pipeline saying which entry it served, and they are
+# counted rather than typed: A is the tag, B is one series, C is several or all.
+for entry in A B C; do
+  grep -Fq -- "entry=${entry}" "$release_wf" ||
+    err "${release_wf}: no longer labels release entry ${entry}; the three documented entries have to be distinguishable in the log, or a run that published the wrong scope cannot be told apart from one that published the right one"
+done
 
 # The source release tag shape, as one literal in both files that check it: the
 # guard that reads the dispatched commit and the callee that refuses push=true.
@@ -171,40 +202,225 @@ if ! grep -Fq -- 'exact="${full}-r${REVISION}-${VARIANT}"' "$build_wf"; then
   err "${build_wf}: the immutable name is no longer composed as <full>-r<revision>-<variant>, so a rebuild would overwrite the snapshot the revision exists to protect"
 fi
 # shellcheck disable=SC2016
-for site in "$release_wf" "$build_wf"; do
+for site in "$build_wf" "$plan_tool"; do
   grep -Fq -- '^[1-9][0-9]*$' "$site" || err "${site}: no longer requires a positive integer image revision before it can become part of a published name"
 done
-# Publishing is only allowed from the default branch, and only with a source
-# release tag: a tag ref may not publish anything, because the ref no longer says
-# what to build. Both halves are the callee's own gate, not just release.yml's.
+# The revision is read out of the registry and never typed. A workflow that still
+# had a revision input would have two answers to "which build is this" -- the one
+# a human remembered and the one the registry serves -- and the one that gets
+# published is whichever step ran last.
+if grep -Fq -- 'inputs.revision' "$release_wf"; then
+  err "${release_wf}: reads a revision input again; the image revision is derived per PHP point version by ${plan_tool} from the exact names the registry already serves (see MAINTAINING.md 'Publishing images')"
+fi
+# What is asserted is the call, not the name: build-version.yml may explain where
+# its revision came from, and a comment that names the resolver is documentation
+# of the hand-off rather than a second resolver.
+if ! grep -Fq -- './'"${plan_tool}" "$release_wf"; then
+  err "${release_wf}: does not call ${plan_tool}, so the version, the revision and the publish/complete/skip verdict are composed somewhere else -- and a second reading of those facts is how two entries publish different things from the same manifest"
+fi
+if grep -Fq -- './'"${plan_tool}" "$build_wf"; then
+  err "${build_wf}: resolves the release plan itself; the callee publishes the revision the caller derived, it does not derive a second one per matrix leg"
+fi
+# The verdict travels with the leg. A revision number alone cannot say which of
+# the three situations it is: r3 the registry has partly served is a release being
+# finished, r3 it has not served at all is a new build, and the write that follows
+# is the opposite of what the other one means. So the assertion is at all three
+# ends -- the resolver's report text, the matrix field, the callee's branch -- not
+# in a comment that can say anything at all.
+# shellcheck disable=SC2016
+for want in 'mode: ${{ matrix.mode }}' ', verdict \(.mode)'; do
+  grep -Fq -- "$want" "$release_wf" ||
+    err "${release_wf}: no longer carries \`${want}\` to the log and the build job -- a leg that arrives without its verdict cannot tell the callee whether an already-served exact name is a conflict or the release being already half-published"
+done
+# shellcheck disable=SC2016
+for want in 'MODE: ${{ inputs.mode }}' 'default: publish' '"$MODE" = complete' '"$role" = mirror' 'publish_one "$r" "$role"'; do
+  grep -Fq -- "$want" "$build_wf" ||
+    err "${build_wf}: no longer contains \`${want}\` -- publishing has to know the verdict it was handed and which registry is answering, or every already-served name becomes a refusal, a half-published release can never be retried, and the mirror that did fail is re-published beside its own snapshot"
+done
+# The stricter default is the one that must be written down: a callee that read an
+# absent verdict as "complete" would turn a genuine clash with the registry into a
+# silent skip, which is the failure mode the revision exists to prevent -- so the
+# literal above is asserted in the input block, where a default belongs.
+# shellcheck disable=SC2016
+for want in 'current="" absent="" unusable=""' '[first build]' '[new build]' '"$max" complete' 'mode: .[4]'; do
+  grep -Fq -- "$want" "$plan_tool" ||
+    err "${plan_tool}: no longer emits \`${want}\` -- the three variant states, the three verdicts they add up to, and the verdict in the leg record are what keeps a series that needs nothing, one that needs finishing and one whose inputs moved from being read as the same question"
+done
+# The inverse half: one bucket for "anything that is not a match" is the reading
+# that made a retry either rewrite a served name or invent a revision, and it is
+# back the moment absences and moved pins are compared together again.
+# shellcheck disable=SC2016  # the literal is shell text to be found, not expanded
+if grep -Fq -- 'mismatch="${mismatch}' "$plan_tool"; then
+  err "${plan_tool}: lumps a missing published variant and a moved pin into one mismatch bucket again -- the first is the release being finished at its revision, the second is a new revision, and one bucket can only answer one of them"
+fi
+# A served name is compared for its architecture set as well as its pins, because
+# a one-architecture image under a multi-arch name is a content difference, and it
+# is not fillable: adding the second architecture means rewriting the manifest
+# list of a name somebody has already pulled. The declared set is stated once in
+# the resolver and the pipeline that produces it must carry exactly that, or every
+# published image reads as missing an architecture and every release bumps every
+# series. So both ends of the agreement are asserted.
 # shellcheck disable=SC2016
 for want in \
-  'refs/heads/main|refs/heads/master) allowed=1 ;;' \
-  'SOURCE_RELEASE: ${{ inputs.source_release }}' \
-  'is not a source release tag'
+  'ARCHITECTURES="${ARCHITECTURES:-linux/amd64 linux/arm64}"' \
+  'compare_platforms' \
+  'compare_record' \
+  'fetch_record' \
+  'absent from the published manifest list'
 do
-  grep -Fq -- "$want" "$build_wf" || err "${build_wf}: no longer contains \`${want}\` -- push=true must require the default branch and a vMAJOR.MINOR.PATCH source release tag, so an image can never be published from untagged source"
+  grep -Fq -- "$want" "$plan_tool" || err "${plan_tool}: no longer contains \`${want}\` -- the architecture set a published manifest list carries is part of the verdict, because a short list is a content difference the four pins cannot see and the only fix that does not rewrite a served name is the next revision"
 done
-if grep -Fq -- 'refs/tags/v[0-9]' "$build_wf"; then
-  err "${build_wf}: gates publishing on a tag ref again; releases dispatch from the default branch and the source tag is checked by content, not by github.ref (see MAINTAINING.md 'Publishing images')"
+# shellcheck disable=SC2016
+if ! grep -Fq -- 'select((.platform.architecture // "unknown") != "unknown")' "$plan_tool"; then
+  err "${plan_tool}: no longer drops unknown/unknown entries when it reads a manifest list's platforms -- buildx attaches provenance and SBOM manifests to the index, they are not architectures, and counting them lets a one-architecture image pass as current"
+fi
+# shellcheck disable=SC2016
+for want in 'arch: [amd64, arm64]' 'for arch in amd64 arm64; do'; do
+  grep -Fq -- "$want" "$build_wf" || err "${build_wf}: no longer builds ${want} -- the architecture matrix and the exact names the merge step refuses to publish partially are the pipeline end of the architecture set ${plan_tool} compares, and the two lists may not drift apart"
+done
+# The mirror is a copy of the primary registry, never a second place that builds
+# the same thing: a PHP compile is not reproducible, so this run's digests differ
+# from a published one even when the pins match, and the mirror writing them under
+# a name the primary already serves would put two contents behind one exact name.
+# The callee must therefore ask the primary before it pushes, and take the
+# primary's name when it is there.
+# shellcheck disable=SC2016
+for want in \
+  'primary_repo="${REGISTRY}/${NAMESPACE}/php"' \
+  'copied_from="$(docker buildx imagetools inspect "${primary_repo}:${exact}" 2>&1)"' \
+  '-t "${repo}:${VERSION}-${VARIANT}" "${primary_repo}:${exact}"'
+do
+  grep -Fq -- "$want" "$build_wf" || err "${build_wf}: no longer contains \`${want}\` -- a mirror registry is filled by copying the primary's published image, so one exact name cannot come to hold this run's fresh digests beside the snapshot the primary already serves"
+done
+# Mirror repair is its own job, and it is a copy list, not a second verdict: the
+# plan reads one registry, and the names the mirror is owed are the names the plan
+# verified. The hand-offs are asserted at both ends -- the scope travels as a plan
+# output rather than being recomposed, and the repair job asks the resolver rather
+# than making up names.
+# shellcheck disable=SC2016
+if ! grep -Eq '^  mirror-repair:' "$release_wf"; then
+  err "${release_wf}: has no mirror-repair job -- the mirror is brought up to the primary by the repair job from the resolver's verified names, and a release whose GHCR half succeeded and whose mirror half failed must be finishable without moving a revision or building again"
+fi
+# shellcheck disable=SC2016
+for want in \
+  '--repair' \
+  'scope: ${{ steps.matrix.outputs.scope }}' \
+  'needs.plan.outputs.scope'
+do
+  grep -Fq -- "$want" "$release_wf" || err "${release_wf}: no longer contains \`${want}\` -- the mirror is brought up to the primary by the repair job from the resolver's verified names, and a release whose GHCR half succeeded and whose mirror half failed must be finishable without moving a revision or building again"
+done
+# The boundary the repair job enforces is two facts, not one: a mirror tag that is
+# missing is filled by copying, but a mirror tag that exists is never written --
+# an incomplete copy (a subset of GHCR's platforms) and a foreign image (a child
+# GHCR does not serve) are separately diagnosed and both refused, because the
+# human who deletes the tag has to know which one they are deleting, and because
+# "patch an existing tag in place" and "overwrite an existing tag" are the same
+# act under either name.
+# shellcheck disable=SC2016
+for want in \
+  'exists but is an incomplete copy' \
+  'rewriting the name to a wider list is the same act as rewriting it to a different image' \
+  'carries images ${primary}:${exact} does not' \
+  'incomplete copies,'
+do
+  grep -Fq -- "$want" "$release_wf" || err "${release_wf}: no longer contains \`${want}\` -- the repair job has to tell an incomplete copy of this build from a foreign image under the same name: both are refused because an existing exact tag is never written on either registry, and the refusal names which one it found so the human deletion knows what it deletes"
+done
+# And the asymmetry the whole table rests on, stated where the rules live: GHCR is
+# the record of what was published, the mirror is a repairable copy, and no mirror
+# failure moves a GHCR revision.
+# shellcheck disable=SC2016
+for want in \
+  'immutable on both registries' \
+  'Docker Hub exact tags are immutable' \
+  'mirror-repair must fail without modifying it' \
+  'repairable' \
+  'not a rebuild, and not a new version'
+do
+  grep -Fq -- "$want" MAINTAINING.md || err "MAINTAINING.md: no longer states \`${want}\` -- the exact name's immutability is the top rule of the whole model on both registries: creation can be automated, an existing exact tag is never overwritten, GHCR records what was published while Docker Hub is a copy that can be repaired, and a mirror that is missing, unreachable or wrong never moves a revision"
+done
+# shellcheck disable=SC2016
+for want in 'emit_repair' 'exact: .[4]' 'floating: .[5]'; do
+  grep -Fq -- "$want" "$plan_tool" || err "${plan_tool}: no longer contains \`${want}\` -- the resolver composes the names it verified and hands them over whole, because a repair that re-derived an exact name could end up pointing a mirror at a name the plan never checked"
+done
+# shellcheck disable=SC2016
+if grep -Fq -- 'cannot be combined: one run emits one list' "$plan_tool"; then
+  : # --json and --repair stay mutually exclusive in the resolver itself
+else
+  err "${plan_tool}: no longer refuses --json and --repair together; two callers with two lists would each have to guess which answer it was about to act on"
+fi
+# The repair job copies; it does not build. Any build step in release.yml is a
+# second pipeline with a second idea of what a published name is.
+# shellcheck disable=SC2016
+for forbid in 'build-push-action' 'docker buildx build'; do
+  if grep -Fq -- "$forbid" "$release_wf"; then
+    err "${release_wf}: contains ${forbid}; the release workflow composes, publishes and repairs by reading registries and calling ${build_wf}, and building in a second place is how a second reading of the same manifest gets published"
+  fi
+done
+# And the multi-series scope, which is where the resolver's separator and the
+# guard's padded list have to agree. Deleting the padding rather than joining the
+# words turns ",8.1,5.6," into "8.15.6": not a series, and an error no reader of
+# the log can account for.
+# shellcheck disable=SC2016
+if ! grep -Fq -- 'scope="$(IFS=,; printf '"'"'%s'"'"' "$*")"' "$release_wf"; then
+  err "${release_wf}: no longer rebuilds the resolver's scope by joining the selected series with commas, which is the only form in which a list of them survives the guard's padding"
+fi
+# shellcheck disable=SC2016
+if grep -Fq -- 'SELECTED" | tr -d ' "$release_wf"; then
+  err "${release_wf}: converts the guard's padded selection by deleting its commas again -- a two-series dispatch then asks the resolver for one series named 8.15.6"
+fi
+# Publishing is allowed from two refs and no others: the default branch, where a
+# dispatch runs, and a tag whose name is exactly a source release, where entry A
+# runs. The source tag is still checked by content as well, so a tag-triggered leg
+# cannot label itself with a release other than the ref it stands on. Both halves
+# are the callee's own gate, not just release.yml's.
+# shellcheck disable=SC2016
+for want in \
+  'refs/heads/main | refs/heads/master) refkind=branch ;;' \
+  'refs/tags/*)' \
+  'SOURCE_RELEASE: ${{ inputs.source_release }}' \
+  'is not a source release tag' \
+  'a tag-triggered release publishes the source its own ref names'
+do
+  grep -Fq -- "$want" "$build_wf" || err "${build_wf}: no longer contains \`${want}\` -- push=true must require the default branch or a conforming tag ref, and a vMAJOR.MINOR.PATCH source release tag either way, so an image can never be published from untagged source"
+done
+if ! grep -Fq -- 'may not publish' "$build_wf"; then
+  err "${build_wf}: no longer refuses a push=true caller standing on a ref it does not accept; a pull request, a branch push and a non-release tag all have to be refused here as well as by release.yml"
 fi
 # The callee must be *told* what it is publishing: release.yml feeds the guard's
 # outputs to the matrix leg, and the PHP version comes out of the manifest.
 # shellcheck disable=SC2016
 for want in \
   'source_release: ${{ needs.guard.outputs.release }}' \
-  'revision: ${{ needs.guard.outputs.revision }}' \
+  'revision: ${{ matrix.revision }}' \
   'version: ${{ matrix.series }}'
 do
-  grep -Fq -- "$want" "$release_wf" || err "${release_wf}: no longer passes \`${want}\` to the release matrix -- the scope, revision and source tag are one hand-off from guard to the build job"
+  grep -Fq -- "$want" "$release_wf" || err "${release_wf}: no longer passes \`${want}\` to the release matrix -- the scope, the resolved revision and the source tag are one hand-off from guard and plan to the build job"
 done
+# The PHP version has one source -- the reviewed manifest -- and since the
+# resolver composes the name it is read in one place too. release.yml's job is to
+# hand the resolver the selection and pass the answer to the matrix, not to grep
+# the manifest a second way.
 # shellcheck disable=SC2016
-for want in \
-  's/^SOURCE_REF=' \
-  '"manifests/${series}.env"'
+for want in 'SOURCE_REF' 'BUILD_VARIANTS' 'highest_revision' 'dev.php-legacy.base-image' \
+  'PATCHSET_APPROVED'
 do
-  grep -Fq -- "$want" "$release_wf" || err "${release_wf}: the matrix no longer reads the PHP version out of \`${want}\` -- the reviewed manifest, not a tag or an input, is what says which PHP version this release builds"
+  grep -Fq -- "$want" "$plan_tool" || err "${plan_tool}: no longer reads \`${want}\` -- the PHP version, the variants, the revision, the pins the verdict turns on and the review flag are the resolver's job and nowhere else"
 done
+# The report a human reads and the matrix that publishes are the same answer: the
+# run asks the registry once, captures what it heard, and rebuilds the legs from
+# the capture rather than from a second read that could disagree.
+# shellcheck disable=SC2016
+for want in '--state-out' '--state-in' '--json'
+do
+  grep -Fq -- "$want" "$release_wf" || err "${release_wf}: no longer passes \`${want}\` to ${plan_tool}, so the log and the matrix would come from two separate registry reads -- and the log is the only thing a reader can check the matrix against"
+done
+# An exact name is written once. The resolver picks a revision the registry has
+# not served; the callee refuses the write if that name exists anyway, which is
+# what turns "8.1.34-r1-cli is that build forever" from a habit into a property of
+# the pipeline.
+if ! grep -Fq -- 'already exists, and an exact published name is never rewritten' "$build_wf"; then
+  err "${build_wf}: no longer asks the registry whether the exact name it is about to write is taken; a re-run would move a digest out from under a name somebody has pinned"
+fi
 # Trigger ownership. release.yml is the only workflow that publishes, and it is
 # dispatch-only, so build-and-verify.yml must not grow a push trigger either: a
 # branch push that built and pushed would write the same floating tags outside the
@@ -252,21 +468,32 @@ fi
 # meant to expand, which is why the patterns are single-quoted.
 # shellcheck disable=SC2016
 for want in \
-  'steps.dispatch.outputs.selected' \
-  'echo "selected=,$series," >> "$GITHUB_OUTPUT"' \
-  'if [ "$series" = "all" ]; then' \
-  'steps.srctag.outputs.release'
+  'steps.scope.outputs.selected' \
+  'selected=",$listed,"' \
+  'steps.srctag.outputs.release' \
+  'steps.scope.outputs.entry'
 do
-  grep -Fq -- "$want" "$release_wf" || err "${release_wf}: no longer contains \`${want}\` -- guard turns the dispatch input into the selected series list and the source release tag into the release output, and the matrix is built from both"
+  grep -Fq -- "$want" "$release_wf" || err "${release_wf}: no longer contains \`${want}\` -- guard turns the entry (tag, one series, a list, or all) into the selected series list, the source release tag and the entry label, and the matrix is built from all three"
 done
-# An empty selection must be refused twice: validate's readiness step and the plan
-# job that would otherwise emit a zero-entry matrix. Without either, a guard that
+# The dispatched branch still has to carry a source release tag; entry A gets one
+# from the ref it is standing on, and both then prove the same thing of git.
+for want in 'git tag --points-at' 'does not point at commit'; do
+  grep -Fq -- "$want" "$release_wf" ||
+    err "${release_wf}: no longer contains \`${want}\` -- the source release is proved against the commit being built, not taken from the event that started the run"
+done
+# An empty selection must be refused three times: the guard that reads the form,
+# validate's readiness step, and the plan job that would otherwise emit a
+# zero-entry matrix. Without the first two, a dispatch that typed nothing becomes
+# either "everything" or "nothing" by accident. Without the third, a guard that
 # emits only separators loops zero times, prints its success line for nothing, and
 # the run goes green with no image published.
+# A resolved-to-nothing selection -- every series already current -- is the one
+# case that is NOT an error, and it is reported rather than refused; that is the
+# resolver's answer, not a missing lock.
 # shellcheck disable=SC2016
 empty_refusals="$(grep -cF -- '[ "$#" -gt 0 ]' "$release_wf" || true)"
-if [ "$empty_refusals" != 2 ]; then
-  err "${release_wf}: ${empty_refusals} empty-selection refusals, expected 2 (the 'Selected series are release-ready' step and the plan job) -- a run with nothing selected must fail, not finish green with no image published"
+if [ "$empty_refusals" != 3 ]; then
+  err "${release_wf}: ${empty_refusals} empty-selection refusals, expected 3 (the guard's scope step, the 'Selected series are release-ready' step and the plan job) -- a run with nothing selected must fail, not finish green with no image published"
 fi
 # One Overview sync per run, and it is a job, not a leg. The Docker Hub Overview is
 # one document for the whole <user>/php repository, so a version=all run must write
@@ -326,13 +553,23 @@ forbid_flat() { # <file> <charter reason> <literal>...
     fi
   done
 }
-model_reason="see the release model in MAINTAINING.md ('Publishing images'): a git tag marks source (vX.Y.Z), the dispatch input picks the series or all, manifests/<series>.env holds the PHP version, and the image name carries the revision (-r<N>, and exact tags are never moved)"
+model_reason="see the release model in MAINTAINING.md ('Publishing images'): a git tag marks source (vX.Y.Z), the entry picks the scope (a conforming tag is every series, a dispatch is one series, a list, or all), manifests/<series>.env holds the PHP version, the registry holds the revision, and the image name carries it (-r<N>, and exact tags are never moved)"
 for f in README.md DEPLOYING.md MAINTAINING.md SUPPORTED.md SECURITY.md; do
   require_flat "$f" "$model_reason" '8.1.34-r1' 'Exact tags are never moved'
 done
 # Only the maintainer document states them, which is why they are not in the loop
 # above: README/DEPLOYING need the image names, not the source tag.
 require_flat MAINTAINING.md "$model_reason" 'vX.Y.Z' 'source release tag'
+# The three verdicts are release mechanics like the four inputs are, so they live
+# in one document and one section. Asserting the section's own words -- the
+# distinction, the hand-off and the mirror rule -- is what catches a verdict being
+# re-derived in a workflow comment while the runbook still says something else.
+verdict_reason="MAINTAINING.md ('Publishing images') is the one place the three verdicts are stated, with the revision model that surrounds them; see its 'The verdict has three answers, because a release can fail halfway'"
+# shellcheck disable=SC2016  # these are document sentences, one of them holds shell text
+require_flat MAINTAINING.md "$verdict_reason" \
+  'The verdict has three answers, because a release can fail halfway' \
+  'Each matrix leg carries it as `mode`' \
+  'A Docker Hub mirror is never read by the plan'
 # The inverse half, widened as each out-of-charter paragraph is moved out (see
 # MAINTAINING.md 'Which document owns what'). SECURITY.md lost its copy when its CI
 # gate inventory moved to MAINTAINING.md ("Hardening gates (what CI enforces)") and
@@ -579,10 +816,12 @@ done
 if [ "$fail" = 0 ]; then
   printf 'Published image address: %s\n' "$published"
   printf 'Local build tag:         %s:<version>-<variant>-test (never pushed)\n' "$local_repo"
-  printf 'Source release tag:      vX.Y.Z (vMAJOR.MINOR.PATCH) marks the dispatched commit; it selects no series and carries no revision\n'
-  printf 'Release scope:           workflow_dispatch version=all or one series; PHP versions from manifests/<series>.env\n'
-  printf 'Published tags:          %s:<full>-r<revision>-<variant> (immutable) and %s:<minor>-<variant> (floating); no latest tag\n' "$published" "$published"
-  printf 'Trigger ownership:       %s is dispatch-only and the only release entry point; %s has no push trigger; %s is dispatch-only\n' "$release_wf" "$ci_wf" "$sync_wf"
+  printf 'Source release tag:      vX.Y.Z (vMAJOR.MINOR.PATCH) marks the commit built from; it names no series and carries no revision\n'
+  printf 'Release entries:         A push v*.*.* -> every supported series | B dispatch one series | C dispatch a list or all\n'
+  printf 'Release scope:           the entry (tag = all, dispatch = version input); PHP versions from manifests/<series>.env\n'
+  printf 'Image revision:          derived by %s per PHP point version from the exact names the registry serves, which also decides publish/complete/skip; no revision input\n' "$plan_tool"
+  printf 'Published tags:          %s:<full>-r<revision>-<variant> (immutable: a publish leg refuses one already served, a complete leg reuses it) and %s:<minor>-<variant> (floating); no latest tag\n' "$published" "$published"
+  printf 'Trigger ownership:       %s publishes (tag push + dispatch, one concurrency group); %s has no push trigger; %s is dispatch-only\n' "$release_wf" "$ci_wf" "$sync_wf"
   printf 'Hub Overview sync:       %s, called once per release by %s (mirror-readme) and by %s for a README-only change; self-tested in both validate jobs\n' "$sync_tool" "$release_wf" "$sync_wf"
   printf 'Document charters:       MAINTAINING.md ("Which document owns what") states one per document, README.md routes to all of them\n'
   [ -z "$pairing_note" ] || printf '%s\n' "$pairing_note"

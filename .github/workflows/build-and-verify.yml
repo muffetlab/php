@@ -95,6 +95,14 @@ jobs:
         run: |
           ./tests/scan-image-harness.sh
 
+      # The release planner's arithmetic, stubbed: fake manifests and a fake
+      # registry read. It asserts the two directions that are easy to get
+      # backwards -- a series whose pins already match is skipped, and a series
+      # whose build record cannot be read is published rather than skipped.
+      - name: Release-plan harness
+        run: |
+          ./tests/release-plan-harness.sh
+
       - name: Version-branch inventory in sync
         run: |
           ./tools/list-version-branches.sh

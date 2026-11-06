@@ -718,6 +718,7 @@ evidence. If the finding names PHP rather than a Debian package, it belongs in
   (shellcheck + `bash -n` over every `*.sh` in the repo, `sh -n`/`bash -n` over
   every Dockerfile `RUN` block, the verify-script stub harness,
   the OS-gate verdict stub harness (`tests/scan-image-harness.sh`),
+  the release-plan resolver stub harness (`tests/release-plan-harness.sh`),
   the version-branch inventory drift check,
   manifest/route/repo policy including Composer overrides,
   Composer pin agreement across layers, published image address consistency
@@ -766,13 +767,18 @@ evidence. If the finding names PHP rather than a Debian package, it belongs in
   multi-arch manifest list, so a failed leg leaves no single-arch tag behind
   (see below).
 - `.github/workflows/release.yml`: the only publishing workflow, and the only
-  release entry point. It is `workflow_dispatch`-only -- there is no tag push
-  trigger -- and runs only from the default branch (main or master, both accepted).
-  Its required `version` input picks the scope (one PHP series or `all`), its
-  required `revision` input is the image revision every published exact name
-  carries, and its guard job refuses a dispatched commit that carries no `vX.Y.Z`
-  source release tag. One run is one validate, one dynamic matrix with a build leg
-  per selected series, and one mirror Overview sync.
+  release entry point. It has two triggers and they are the three entries: a
+  `push:` of tags filtered on `v*.*.*` (entry A, which selects every supported
+  series) and `workflow_dispatch` with the required `version` input (entry B for one
+  series, entry C for a list or `all`). A dispatch runs only from the default branch
+  (main or master, both accepted) and a tag only publishes if its own name is exactly
+  `vMAJOR.MINOR.PATCH`. There is no `revision` input: `tools/release-plan.sh` derives
+  the image revision every published exact name carries from the names the registry
+  already serves, per PHP point version, and the whole run shares one `release`
+  concurrency group so that read cannot straddle another release. Its guard job also
+  refuses a commit that carries no `vX.Y.Z` source release tag. One run is one
+  validate, one resolver pass, one dynamic matrix with a build leg per selected series
+  that has something to publish, and one mirror Overview sync.
   Re-runs the full
   validate gate, refuses empty releases, and pushes reviewed images.
 - Unfilled manifests cause the corresponding build to **skip**, not fail: the
@@ -866,22 +872,27 @@ them one agreement rather than two documents that happen to agree today.
   per-version divergence cannot accumulate undocumented — which matters because
   "backport coverage does not transfer between minor versions".
 - **No pull request or branch push can reach a registry** — pushes to registries are
-  only possible from `main`/`master`, only through `release.yml`, and only from a
-  manual dispatch: it is the sole caller that passes `push=true` to the reusable
-  build job. The required `version` input names the PHP series, or `all` for every
-  supported series at once, and the required `revision` input is the image revision
-  every published exact name carries. Each run publishes exactly the series it
+  only possible from `main`/`master` or from a conforming `vX.Y.Z` tag ref, only
+  through `release.yml`, and only from one of the three human acts that start a
+  release: it is the sole caller that passes `push=true` to the reusable
+  build job. The `version` input names the PHP series, a list of them, or `all` for
+  every supported series at once; a tag push selects `all` without anyone typing it.
+  Neither names the image revision: `tools/release-plan.sh` derives it from the exact
+  names the registry already serves, so a caller cannot ask for a build number that
+  would overwrite one. Each run publishes exactly the series it
   selects, and its validate job fails the run if a selected series' manifest is not
   pinned and approved — so a mistargeted release cannot end as a green run that
   published nothing, and a full release with one unreviewed series pushes nothing at
   all. `build-and-verify.yml` runs on `pull_request` and manual dispatch, never on a
   push, and always calls that job in test mode.
 - **Publishing requires tagged source** — `release.yml` checks out the full tag
-  history and its guard refuses a dispatched commit that carries no `vX.Y.Z` source
-  release tag; the callee independently refuses `push=true` unless `source_release`
-  names one, and it only publishes from `main`/`master` — never from a tag ref. A git
-  tag marks source and nothing else: it selects no PHP version (that is the dispatch
-  input and the manifest's `SOURCE_REF`), carries no image revision, and appears in no
+  history and its guard refuses a run that cannot name a `vX.Y.Z` source
+  release tag on the commit it builds; the callee independently refuses `push=true`
+  unless `source_release` names one, and it accepts only `main`/`master` or a tag ref
+  whose own name is that release — never a pull request ref and never a tag that
+  points at different source from the one it is building. A git
+  tag marks source and nothing else: it selects no PHP version (that is the entry and
+  the manifest's `SOURCE_REF`), carries no image revision, and appears in no
   image name, so one tag covers a release of eight series and there is no tag shape
   that can be mistyped into building the wrong one. Release tags are never moved or
   deleted, and the registry's `-r<N>` namespace is the append-only history of builds.
@@ -961,22 +972,41 @@ Registry defaults to GHCR and the published image is `ghcr.io/muffetlab/php`
 `muffetlab`); a Docker Hub mirror is pushed automatically when
 `DOCKERHUB_USERNAME`/`DOCKERHUB_TOKEN` secrets exist.
 
-**Four things, four jobs.** Nothing in this pipeline has to do two jobs, because the
+**Five things, five jobs.** Nothing in this pipeline has to do two jobs, because the
 coupling is what made a full release cost eight tags:
 
 | Question | Answered by |
 | --- | --- |
-| Which source is an official release? | a git tag on the dispatched commit: `vX.Y.Z` (say `v1.0.0`) |
-| Which PHP series does this run build? | the `version` input of the dispatch: `8.1`, or `all` |
+| Which source is an official release? | a git tag on the commit built from: `vX.Y.Z` (say `v1.0.0`) |
+| Which PHP series does this run build? | the entry: a tag push is every supported series, a dispatch names one, a list, or `all` |
 | Which PHP version is that series? | `SOURCE_REF` in `manifests/<series>.env` |
-| Which build of that version is this image? | the `revision` input, published as `-r<N>` |
+| Which build of that version is this image? | the registry: one above the highest `-r<N>` it serves for that PHP version -- or that same number, when this run is finishing a release a previous one started |
 | What does a deployment pull? | Docker tags, below |
 
-A git tag therefore selects nothing, carries no revision, and appears in no image
+A git tag therefore names no PHP series, carries no revision, and appears in no image
 name -- which is what lets one tag cover a release of eight series, and what makes
 `v1.1.0` next to `v1.0.0` mean "a new source release" rather than "a different PHP
 version". Adding PHP 8.2 costs a manifest and a `SUPPORTED_VERSIONS` row; the
 release mechanism does not change.
+
+**Three entries, one pipeline.** A, B and C are three ways to ask; there is one thing
+that answers. Each ends in the same guard job, the same validate gate, the same
+`tools/release-plan.sh` and the same dynamic matrix, so which version, which revision
+and publish, complete or skip are decided once per run wherever the run was started
+from.
+
+| Entry | How it is started | What it publishes |
+| --- | --- | --- |
+| A | push a `vX.Y.Z` source release tag | every supported series not already current |
+| B | dispatch `release.yml`, `version` = `8.1` | that series |
+| C | dispatch `release.yml`, `version` = `8.1,7.4` or `all` | those series, in one run |
+
+A is the release: one tag, no form, eight series considered. B is the targeted fix or
+rebuild, and C the consolidated update -- both are the same step of the same
+workflow, and the run log labels which one it served. An empty `version` on a
+dispatch is refused rather than read as `all`, because the mistake that form makes
+is a full release nobody asked for; a tag push selects `all` because pushing the tag
+*is* the act that asks for one.
 
 Tag scheme:
 
@@ -992,13 +1022,166 @@ that image until it moves on purpose; `<minor>-<variant>` is the name that carri
 fix to a deployment without an edit. SUPPORTED.md's generated "Release tags"
 section names, per variant, the exact tag the registry currently serves behind
 the floating one -- which is the highest revision it has, read live.
-Re-dispatching the *same* revision does overwrite that one name; the guard asks a
-human for the number rather than deriving it from the registry exactly because two
-runs that each concluded "I am r1" would fight over it, so a fix ships as `r2`.
 
-Names published before the revision existed are bare (`8.1.34-cli`); they stay in
-the registry as the snapshots they are, are read as revision 0 by the generator, and
-are not rewritten.
+**The registry holds the revision.** The number is typed by nobody and stored
+nowhere in this repository. `tools/release-plan.sh` lists the names
+`ghcr.io/<namespace>/php` serves, finds the highest `-r<N>` for the PHP version the
+manifest pins -- counted across every variant that series declares, because cli and
+fpm are one build -- and proposes one more. A PHP version the registry has never
+served is planned as `r1`. Names published before the revision existed are bare
+(`8.1.34-cli`); they stay as the snapshots they are, read as revision `0`, so the
+first revisioned build of the same version is `r1` beside them rather than a
+replacement of them. Each point version counts on its own: `5.6.40` at `r2` and
+`8.1.34` at `r1` are both correct answers to "which build of this PHP version is
+this", and a run that publishes both is not forced to give them the same number.
+What the shared number used to buy -- `r2` meaning one release of *this kit* across
+eight series -- is bought instead by the source release tag all eight legs are
+built from.
+
+Deriving the number from the registry is what makes a re-run safe rather than lucky.
+Under the input, re-dispatching the same revision overwrote that one name, and two
+runs that each believed they were `r1` could fight over one published tag; now the
+second run reads `r1` as already served and asks for `r2`, and a fix cannot ship as
+a moved `r1`. The write is guarded too: before merging, `build-version.yml` asks
+each registry whether the exact name it is about to publish is already served, and
+what it then does is decided by the verdict the plan handed that leg -- see the
+three of them below -- so "an exact published name is never rewritten" holds even
+when the plan itself raced. What that read depends on is the run's serialisation: the whole
+workflow shares one `release` concurrency group rather than a per-ref group, because
+a plan computed while another release is mid-merge is a plan about a registry that is
+about to disagree. `cancel-in-progress` is false on purpose -- a cancelled run can
+leave per-arch digests pushed with no manifest list merged, so the later run queues.
+
+**The verdict has three answers, because a release can fail halfway.** The
+resolver reads the four OCI labels each published image carries -- source commit,
+source ref, base image digest and OpenSSL route -- and the architecture list each
+published manifest list carries, and compares them with the manifest, per declared
+variant, at the highest revision the registry serves for that PHP version. Each
+variant is one of three things there, and telling them apart is what makes a retry
+of a failed release reuse its revision instead of incrementing past it:
+
+* **current** -- served, all four pins equal, and its manifest list carries every
+  architecture this pipeline builds: this variant already is the build this release
+  would have made;
+* **absent** -- the name is not served at all: the half of a release that never
+  merged, which is what a retry is for;
+* **unusable** -- served, but a pin differs from the manifest, its build record
+  cannot be read at all, or its manifest list is short of a declared architecture.
+  "The pins are unknown" is not "the pins match", an image built from inputs the
+  manifest no longer declares is not this build under another number, and a
+  one-architecture list is not a smaller copy of the same build -- it is a content
+  difference, because adding the missing architecture means rewriting the manifest
+  list of a name somebody has already pulled.
+
+A series of nothing but current variants is **SKIP**: no build, and the report line
+names the revision the registry is already at. A series with any unusable variant is
+**PUBLISH** at the next revision for *every declared variant*, not just the one that
+looks different, so `r<N>` keeps meaning one reviewed build of a PHP version rather
+than a per-variant counter nobody can read off a name. A series of current and absent
+variants only is **COMPLETE** at the revision it stopped at: the number stays, the
+missing variants are built at it, and the names already served there are left exactly
+as they are -- the failed release is finished under the revision it began with, which
+is also the answer to "why not just increment". The bare pre-revision names are the
+one exception, and it is arithmetic rather than judgement: there is no number to
+reuse and writing a second bare name is not available, so such a series is completed
+as `r1`, the first build whose number exists.
+
+**The rules, stated once.** Everything above reduces to eight questions about the
+revision, and every entry answers them the same way. The table separates the two
+facts a short sentence would blur: a *missing tag* -- a name the registry does not
+serve at all -- can be filled, while an *existing tag that is incomplete* cannot be
+patched in place, on either registry.
+
+| Situation | The revision |
+| --- | --- |
+| GHCR published, the Docker Hub mirror did not (or the mirror was unreachable) | unchanged -- only the mirror is repaired, by copying what GHCR already serves (below), never by rebuilding |
+| GHCR is missing one of the series' declared variants: the whole tag does not exist | unchanged -- that variant is built at the revision it stopped at (a `complete` leg) |
+| GHCR serves the exact tag, but it carries fewer architectures than the pipeline builds | the whole series +1 -- the served name is never rewritten, so the gap is filled by the next revision, whose freshly composed list carries every architecture |
+| The mirror is missing a variant tag, or one of its exact tags is missing an architecture | unchanged -- a missing tag is copied from GHCR; an existing incomplete tag is never patched in place, so the repair job refuses, the human deletes the tag, and the re-run re-syncs it from GHCR whole (below) |
+| An exact tag's content differs from what the manifest declares, on GHCR | the whole series +1 -- this is the plan's `unusable` verdict |
+| An exact tag on the mirror carries images GHCR does not | unchanged on GHCR -- the repair job refuses the run and names the fix: delete the mirror's tag, then re-run the same scope; the next pass finds the name free and copies GHCR's into it |
+| Both registries agree with the manifest everywhere | unchanged -- the series is skipped, and the run says so |
+
+plus the one rule that is not about the registries at all: the build inputs a
+revision was made from are the four manifest pins, so a manifest that moved under a
+published revision is the whole series +1, the same answer a moved pin or an
+unreadable build record gets.
+
+The order of those rules is fixed, and the top of the order is the exact name: it is
+immutable on both registries, and every filling rule above stops at an existing tag
+-- the only writes this pipeline ever makes to an existing exact name are refusals.
+Docker Hub exact tags are immutable. If an existing tag is incomplete or differs
+from GHCR in any way, mirror-repair must fail without modifying it. Manual deletion
+is required before the next run can copy the complete tag from GHCR.
+GHCR is the registry that records what was published, and Docker Hub is a repairable
+copy of it; that asymmetry is why the mirror-side rows move no revision while the
+GHCR-side ones do. A mirror that is missing, unreachable or wrong is a fact about
+the copy, never about the record: no Docker Hub failure moves a GHCR revision, and
+deleting a mirror tag so the next pass can re-copy it is a repair of the mirror --
+not a rebuild, and not a new version of anything.
+
+The architecture row is the one place "不变，补齐" and "精确名一律不动" could look
+like they disagree, so it is worth being exact about which one wins: a *variant*
+that is missing is a name that does not exist, and a name that does not exist can be
+written at the revision it stopped at; an *architecture* that is missing lives
+inside a name that does exist, and amending it would rewrite a list somebody has
+already pulled by that name. The invariant wins, and "补齐" happens at the next
+revision, where the list is composed once, whole.
+
+The verdict is not dropped on the way to the builder. Each matrix leg carries it as
+`mode`, and the publish step asks the registry for its exact name once per registry
+before writing anything. On a `publish` leg the plan read the primary registry and
+promised a revision it found nothing at, so a name served *there* is the registry
+having moved under the run: the leg refuses, because publishing the series' other
+variant beside that name would give one revision number two pinsets. On a `complete`
+leg a served name is expected: the snapshot is left untouched and only
+`<minor>-<variant>` is re-pointed at it, which restores the one invariant a revision
+has -- the floating name is the newest revisioned build -- without rewriting
+anything. A Docker Hub mirror is never read by the plan, so a name it already serves
+can only be the residue of a run that published to the primary registry and failed
+here: that registry is skipped and the others are still published, which is what lets
+a retry finish the release instead of being refused by the half that already
+succeeded. And the ask on the mirror is different in one more way: before it takes
+this run's digests under a name, the publish step asks the primary whether the
+primary already serves that exact name, and when it does, the mirror copies the
+primary's image (`imagetools create` from the primary's name) instead of pushing
+freshly built digests. A PHP compile is not reproducible -- this run's amd64 layer
+differs from a published one even when every pin matches -- so a mirror that filled
+the name from this run would hold a different image behind the same snapshot GHCR
+serves, and the mirror is a copy or it is nothing.
+
+**The mirror repair.** What the matrix cannot reach is a series the plan skipped:
+GHCR is current, no leg runs, and the mirror can still be missing a name from an
+older run. `release.yml`'s `mirror-repair` job is the answer, and it is a copy job,
+not a second verdict. It asks the resolver for its repair list (`--repair`): every
+declared variant the plan verified as current, with the exact name and the floating
+name that points at it. It then reads both registries live, reduces each name to the
+set of `os/arch → digest` a puller resolves (attestation entries dropped -- they are
+not architectures, and GitHub's attestation storage does not exist on the mirror),
+and per name: missing on the mirror → copied from GHCR by digest-exact `imagetools
+create`; already equal → reported, nothing written; existing but different →
+refused, never written, and the refusal says which of the two differences it found,
+because the human deleting the tag should know what they are deleting: a *subset* of
+GHCR's platforms is an incomplete copy of this build, while a child digest GHCR does
+not serve is a different image -- both re-sync from GHCR after the deletion, and
+neither moves a revision. The floating names are
+checked against the exact ones rather than remembered, so a mirror whose snapshot is
+right and whose `<minor>-<variant>` points one revision back is corrected in the
+same pass. The job runs whatever the matrix did -- after it, whatever its result --
+because "GHCR succeeded, the mirror failed" is exactly the case where the next run
+has nothing to build and still something to copy, and because a matrix leg that
+failed on the mirror alone has left GHCR correct. It reads the registry afresh
+rather than reusing the plan job's capture: the matrix has published since that
+capture, and a repair planned from it would copy the state the release departed
+from. The scope it asks about is the plan's own, handed over as an output.
+
+So a full release after a docs-only commit, or an entry-A push whose tag changes no
+pin, resolves to no legs at all. That is a reported outcome, not a failure: the plan
+step prints the SKIP lines, adds a notice naming the entry and the selection, the
+release matrix gets `include: []`, and the Overview sync and the package-visibility
+job go unscheduled because they follow the release job's success. A selection that
+named no series in the first place is the opposite case and is refused, three times
+over -- see *CI (GitHub Actions)*.
 
 **How the tag table is read out of the registry.** `tools/gen-supported.sh` asks
 the registry rather than the repository, because which tags exist is not a fact
@@ -1028,9 +1211,10 @@ committed file against exactly this read, which is why a registry outage blocks 
 release rather than a release shipping beside a status page that cannot say what it
 checked.
 
-There is no `latest` tag, by design. A release run publishes the series its input
-selects — one series for a single-series dispatch, every supported series at once
-for `version=all` — so a `latest-<variant>` tag would resolve to whichever series
+There is no `latest` tag, by design. A release run publishes the series its entry
+selects — one series for `version=8.1`, the named few for a list, every supported
+series for `all` or for a tag push — so a `latest-<variant>` tag would resolve to
+whichever series
 was released last: release order, not code. Releasing 7.4 after an 8.1 release
 would move it back to 7.4, and an unrelated rebuild of an older series could move
 it backwards — neither the newest PHP nor a recommendation, and exactly the silent
@@ -1055,7 +1239,15 @@ mirror would lose the GHCR tags if the mirror refused, and its error could not
 say which registry did it. A refused mirror still fails the job — half a release
 is not a release — but only after the primary publish is done, and the failure is
 reported as an annotation naming the repository, because a publishing log is
-truncated in the Actions UI while annotations are not. The merge carries each
+truncated in the Actions UI while annotations are not. Each call is also told
+whether it is the primary registry or a mirror, because "already published" is a
+different fact on the two: the plan reads only the primary, so a name served on a
+mirror is a gap that run left and is skipped there while the rest are published
+(see the three verdicts above) -- and when the name is *not* served on the mirror
+but is served on the primary, the mirror takes the primary's image rather than this
+run's digests, because the mirror is a copy of the primary registry and a PHP
+compile is not reproducible. Names the matrix never reaches -- a skipped series
+above all -- are the `mirror-repair` job's, below. The merge carries each
 platform's provenance/SBOM attestation manifests into the list, a step asserts
 both platforms are present — a partial list fails the release instead of passing
 silently — and a reporting step counts the attestation manifests the published
@@ -1108,7 +1300,7 @@ nothing a manifest does not already say). The route stays in
 `/opt/php/BUILD-PROVENANCE`, the `dev.php-legacy.openssl-route` label and the
 SUPPORTED.md table. What the old scheme cost — a future route migration for the
 same PHP version replacing `8.1.34-fpm` with a different libssl build — is what the
-per-build revision removes: that migration is now `revision=2`, publishing
+per-build revision removes: that migration is now the next revision, publishing
 `8.1.34-r2-fpm` beside the old snapshot instead of over it. The floating `8.1-fpm`
 still follows the newest build, so a route migration is still a reason to read the
 label rather than guess from a name, and deployments that must not move at all pin
@@ -1119,11 +1311,13 @@ committed by hand) → finish reviews and update
 `manifests/SECURITY-REVIEW.md`, and update `manifests/OS-CVE-STATUS.md` for anything
 reported against the Debian package closure (the base bump a rebuild takes, or a row
 with tracker evidence for what it cannot) → `./tools/gen-supported.sh` and commit →
-tag that commit as a source release (`git tag v1.0.0 && git push origin v1.0.0`) →
-dispatch `release.yml` from the default branch with `version` (one series or `all`)
-and `revision` (the image revision, `1` for the first build of what the manifests
-pin). The tag is a prerequisite, not a selector: it marks the source the images were
-built from, and the run refuses to publish without one. Every leg runs
+tag that commit as a source release and push the tag (`git tag v1.0.0 && git push
+origin v1.0.0`), which is entry A and releases every supported series that is not
+already current; or dispatch `release.yml` from the default branch naming `version`
+(one series, a list, or `all`), which is entries B and C. There is no `revision`
+input to either: the number each published name carries is read from the registry,
+as above. The tag is a prerequisite even for a dispatch -- it marks the source the
+images are built from, and the run refuses to publish without one. Every leg runs
 `tools/scan-image.sh` over the image it built before pushing anything, so a release
 cannot publish an OS finding that is neither fixed by the refresh nor registered.
 
@@ -1133,40 +1327,41 @@ does not name a PHP version, does not carry the image revision, and appears nowh
 in an image name, which is why one tag covers a release of eight series and why the
 tag namespace stays an append-only history of source rather than a history of builds
 (that is the registry's `-r<N>` namespace, and SUPPORTED.md reads it live). Tags are
-never moved or deleted, and a run whose commit has no `vX.Y.Z` tag fails in the guard
-before any build starts — publishing is refused from untagged source at both ends:
-`release.yml` checks `git tag --points-at`, and `build-version.yml` refuses
+never moved or deleted, and a run that cannot name a `vX.Y.Z` tag on the commit it is
+building fails in the guard before any build starts — publishing is refused from
+untagged source at both ends: `release.yml` proves the tag with `git tag --points-at`,
+and `build-version.yml` refuses
 `push=true` unless `source_release` names such a tag.
-`v1.0.0-rc1` is not a release tag and never starts a publish: the guard's regex is
-`vMAJOR.MINOR.PATCH`, and a commit carrying only `v1.0` or no tag at all is refused
-the same way.
-The revision is the other half, and it is asked for, not derived: `revision` is a
-required, positive integer, and every published exact name carries it. Two runs that
-each concluded "I am r1" would fight over one published name, so the number is the
-human's decision — and because the name always has one, the old failure mode where a
-rebuild with no number republished the bare name over the snapshot it was supposed to
-protect is gone by construction. The number is shared by every series in the run,
-which is what makes `r2` a release of *this kit* rather than of one PHP version:
-`5.6.40-r2-cli` and `8.1.34-r2-cli` are different PHP versions and the same second
-build.
-Two builds of one series must not overlap either: the concurrency group is per ref,
-so a second dispatch started while the first is running queues behind it rather than
-building twice — but two dispatches naming the same revision still resolve to the
-same published names, so wait for the first run to finish before cutting `r2`.
-**A run publishes the series its input
+Entry A adds the one thing entry B and C could not: the run stands *on* the tag, so
+the guard requires the ref name and the source release the run publishes to be the
+same string, and a tag-triggered leg cannot label itself with a release other than
+the ref it stands on.
+`v1.0.0-rc1` is not a release tag. GitHub's tag filter is a glob and not a regex, so
+`v*.*.*` — the widest filter that still excludes a name like `v1.0` — matches it as
+well, and a run does start for it: the guard's own check is the regex
+`vMAJOR.MINOR.PATCH`, and it ends that run in seconds — before a checkout, before any
+build job exists, and having published nothing. A tag that does not look like a
+version at all starts no run whatever else it is named, which is what the filter is
+for. The cost of the glob is one red run per pre-release tag; the cheaper habit is to
+name pre-releases outside the filter, and the run's error message says so. The
+revision and the concurrency group that protects it are described above, once: they
+are the registry's business, and a tag has no part in either.
+**A run publishes the series its entry
 selects**: `version=5.6` rebuilds 5.6's `cli` and `fpm` on both
 architectures and nothing else, and the series a run does not select keep their
 previous images — including their previous base digest, which only a release of
 *that* series picks up. The PHP version each selected series builds comes from
 `SOURCE_REF` in its manifest and is carried into the matrix, so nothing between the
-input and the image name is allowed to restate it. A release can
+entry and the image name is allowed to restate it. A release can
 be run for one PHP series (a free string validated against the supported list, so
-the list is not duplicated as a `choice` menu) or for `all` of them, and both paths
-write the same exact and `<minor>-<variant>`
-names — there is no `latest` tag for the two paths to differ over.
+the list is not duplicated as a `choice` menu), for several of them as a list, or for
+`all` of them -- by name or by pushing a tag -- and every path
+writes the same exact and `<minor>-<variant>`
+names — there is no `latest` tag for the paths to differ over.
 
-**Why a full release is one run and not eight.** A full release is one
-`version=all` dispatch, and it is not a matter of convenience: eight dispatches would
+**Why a full release is one run and not eight.** A full release is one tag push, or
+one `version=all` dispatch, and it is not a matter of convenience: eight dispatches
+would
 each be a separate run of the same commit, and the reason that is worse than merely
 wasteful is the
 `SUPPORTED.md up to date` gate in `validate`, which reads the *live* registry:
@@ -1329,9 +1524,10 @@ scope parenthetical (`(PHP 5.6 – 8.1, CLI + FPM)`) from failing its own verifi
 **Where it runs.** The release path is `release.yml`'s `mirror-readme` job: one job,
 after the matrix, one call. It is deliberately not a step in `build-version.yml`,
 where it used to sit on the `cli` leg of each merge job — the Overview is one piece of
-metadata for the whole `<user>/php` repository, and a `version=all` run starts eight
-matrix legs, so a step there means eight PATCHes of an identical body with one green
-leg covering seven failures. As a job of its own it also says what it covers: the
+metadata for the whole `<user>/php` repository, and a full release starts a leg per
+supported series, so a step there means several PATCHes of an identical body with
+one green leg covering the others' failures. As a job of its own it also says what
+it covers: the
 release published, then the page was synced. It is
 `continue-on-error`, for the reason every tail step here has: the tags and layers are
 already published, and a red job at the end of a good release invites someone to
@@ -1381,12 +1577,14 @@ placeholders, non-digest base images, and unpinned commits.
 - `tests/composer.sh`: per-series version policy, phar digest + provenance cross-check, offline validate, best-effort diagnose
 - `tests/verify-harness.sh`: runs `tools/verify-*.sh` against stub `php`/`php-fpm`/`openssl`/`ldd`/`sha256sum`/`dpkg-query` binaries — 47 positive/negative cases, no Docker or PHP compile required
 - `tests/scan-image-harness.sh`: runs `tools/scan-image.sh` against a stub `docker` (serves `/opt/php/RUNTIME-OS-PACKAGES`, and for one case a pending-upgrade line in apt's own `Inst pkg [old] (new)` format) and a stub `trivy` (absent / failing / reporting) — 13 cases over the verdict, the JSON's `scanner` field and the exit code, against the real register, including the parser edges: JSON with long metadata before `Results` (`json-long-metadata`), text lines containing `|` (`text-pipes`, `csv-mixed`), an empty report (`empty-report`), and `--findings -` with the `*` frozen-archive row (`stdin-wildcard`). `jq` is needed for the trivy-JSON cases, so both static-gate jobs install it
+- `tests/release-plan-harness.sh`: runs `tools/release-plan.sh` against generated manifests and a captured fake registry (its `--state-out`/`--state-in` pair), with no network — 34 cases over the revision arithmetic (never-published → `r1`, bare names → `r1`, variants split across revisions → one number above the highest) and over the three verdicts, in both the report and the leg JSON's `mode`: a series whose four pins already match is *skipped*, one whose build record cannot be read is *published* one revision higher because an unknown pin is not a matching one, and a series that is current on one variant and missing on the other is *completed* at the revision it stopped at rather than incremented past the name that is already served. The architecture set is decided by the same verdicts: a name whose manifest list is short a declared architecture is *published* one revision higher because the name cannot be amended in place, an empty list is every architecture missing, extra architectures are not a gap, and the declared set itself is overridable so a longer build matrix is caught. Also exercises the mirror repair list (`--repair`): every verified variant becomes one copy instruction with the exact and floating names spelled, a series that publishes owes the mirror only the variants the registry could confirm, and nothing verified is an empty array rather than a skipped job. Also asserts the refusals: an empty scope, an unknown series, a manifest with no `SOURCE_REF`, a registry that answered with no tags, a state file that is not one, a capture from before the architecture set was compared, and `--state-out` combined with `--state-in` or `--json` combined with `--repair`. `jq` is required, so both static-gate jobs install it
 - `tools/verify-build.sh`: build-stage assertions (`php -m`, `php --ri`, linked OpenSSL vs route, 8.x version floors); installed as `/usr/local/bin/verify-build` and called from the Dockerfile
 - `tools/verify-runtime.sh`: final-image assertions (binaries run, provenance present, Composer version + phar digest match the build record, no unresolved libraries, runtime OpenSSL vs route, shipped/omitted source tree matches `BUILD-CLEANUP` and is still a usable build tree, `/opt/php/RUNTIME-OS-PACKAGES` agrees package-for-package *and version-for-version* with `dpkg-query`); shipped in the image as `/usr/local/bin/verify-runtime` so the audit can be re-run on a pulled image
 - `tools/lint-dockerfile-shells.sh`: joins each Dockerfile `RUN` continuation the way the parser does and syntax-checks the result with `sh -n` and `bash -n`
 - `tools/list-version-branches.sh`: inventories every `# version-branch: <tag>` marker and, with `--check`, fails if the tags and the "Version-conditional behaviour" table here disagree in either direction
 - `tools/report-image-size.sh`: `./tools/report-image-size.sh <image-ref> [label]` — size, largest layers, in-image `du` breakdown and the cleanup record, appended to `$GITHUB_STEP_SUMMARY`; reports only, `BUDGET_MB` adds an advisory over/under line
 - `tools/gen-supported.sh`: regenerates `SUPPORTED.md` from manifests + review statuses + the live registry (CI checks drift). Its "Upstream end of life" table is static data on purpose — php.net cannot publish another release for a branch it has stopped — so a new series gets a hand-recorded row from `https://www.php.net/eol.php` plus that series' changelog, while the "Pinned here" column is read from the manifest's `SOURCE_REF` at generation time and says so when the pin sits below php.net's final release
+- `tools/release-plan.sh`: `./tools/release-plan.sh --scope <series[,series…]|all> [--namespace <owner>] [--json | --repair] [--state-out FILE | --state-in FILE]` — the release resolver, and the only place that answers "which PHP version, which revision, publish, complete or skip" for a release run. It reads the manifests, lists the names the registry serves, and either prints the verdict per series for the log, emits the matrix legs as JSON, or — with `--repair` — emits the names it verified as current, as the copy list `release.yml`'s mirror-repair job takes to the Docker Hub mirror. It reads the primary registry only; the mirror is never asked anything here, because a mirror that is behind is not a fact about what the primary should publish. `--state-out` captures the read and `--state-in` replays from that capture, which is how one run's log and one run's matrix are the same answer to one registry query. `tests/release-plan-harness.sh` exercises the arithmetic against fixtures with no network, and it reads only — it has no credentials and publishes nothing
 - `tools/check-image-name.sh`: reads the registry/namespace defaults out of the release workflow and fails if the docs, the tag composition or the GHCR package name no longer describe the same published address (`ghcr.io/muffetlab/php`)
 - `tools/resolve-base-digest.sh`: `--check` reports each base tag's current digest and flags every manifest still on `@sha256:REPLACE_WITH_DIGEST`; `--base <tag>` resolves a tag no manifest names (a candidate base) and `--value` prints only that digest-pinned reference, which is what the CI trial job captures; prints, never writes
 - `tools/check-pin-drift.sh`: compares each `PHP_SRC_COMMIT` with the peeled commit of its upstream tag via `git ls-remote`; advisory only, never fails a build
