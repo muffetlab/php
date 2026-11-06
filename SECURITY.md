@@ -17,6 +17,54 @@ There is no warranty that any image is free of vulnerabilities. See
 [DISCLAIMER.md](DISCLAIMER.md). A published image is only as current as the
 review date recorded for its version.
 
+## Known limits — read before deploying
+
+The six limits below are the ones a deployer has to decide about. The
+consumer-facing summary is the "Security notice" in [README.md](README.md); this
+is the full statement of each.
+
+1. **Every series here is end-of-life upstream** (5.6–7.4 long since, 8.0 in
+   2023 and 8.1 in December 2025). A successful build does not make any of them
+   fully supported or secure.
+2. `shivammathur/php-src-backports` is the source of record for every series,
+   not a guarantee that every CVE is fixed. Its head commit for each series
+   carries the current bailout / CVE-2026-109618-109619 work (see the review
+   record), but coverage is what the pinned commit says it is — verify it per
+   minor version, and verify with a build and test run before treating it as
+   production evidence.
+3. CVE-2026-109618 and CVE-2026-109619 (public since Oct 2026) need separate
+   verification for **every** version in scope. Dedicated legacy-backport
+   projects publish targeted patches for them, but those projects state their fix
+   scope is limited and does not replace full security maintenance. If the fix is
+   already in the pinned commit, do not apply the patch again.
+4. This kit does **not** include unverified CVE patches. Do not add a patch merely
+   because its filename mentions a CVE. Two separate things are being claimed when a
+   patch ships, and only one of them is mechanical:
+   *the hash* — the bytes an image carries are the bytes a human looked at, and that
+   equivalence is what a machine can check; the check, and the review record it
+   reads, are described in [MAINTAINING.md](MAINTAINING.md)
+   ("Hardening gates (what CI enforces)").
+   *the judgement* — whether the patch belongs on that target branch, is a correct
+   backport rather than a textual collision, whether it is already in the pinned
+   commit, and whether it regresses anything. That is a human decision recorded in
+   a `patches/REVIEW-*.md`, and no hash check can substitute for it. A recorded
+   digest on a patch nobody reviewed is exactly the failure this rule exists to stop.
+5. PHP 5.6's OpenSSL compatibility is a separate engineering problem, and so is
+   its base. The 5.6 image is built on Debian bullseye because that is the Debian
+   release carrying OpenSSL 1.1.1w; bullseye reached the end of its Debian LTS
+   window on 2026-08-31 and
+   its `-security` pool has moved to `archive.debian.org`, so the OpenSSL inside a
+   5.6 image is frozen at `1.1.1w-0+deb11u8` and there is no maintained security
+   source behind it. Do not run that in an internet-facing production workload
+   without accepting the freeze explicitly. The Dockerfile redirects that suite to
+   the archive in both stages, so 5.6 builds reproducibly and users can still
+   `apt-get` inside the image — the freeze is deliberate, not a broken mirror. The
+   measured evidence and the decision are recorded in
+   [manifests/SECURITY-REVIEW.md](manifests/SECURITY-REVIEW.md).
+6. The Dockerfile uses `BASE_IMAGE` as both build and runtime base to avoid
+   silently copying binaries across incompatible libc/OpenSSL environments. This
+   is safer as a starting point, but it is not a multi-stage minimal runtime yet.
+
 ## Reporting a vulnerability in this kit
 
 If you find a security problem **in the kit itself** — e.g. a patch recorded
@@ -44,15 +92,12 @@ private channel if the fix is not yet public. The expected maintainer flow:
    new immutable image through the release workflow at the next image revision —
    `8.1.34-r2-fpm` beside the `8.1.34-r1-fpm` that is already published. The PHP
    version does not change for an OS or patchset fix; the revision does. Exact tags
-   are never moved, so the previous build keeps its own name and digest in the
-   registry until someone publishes that exact name again — re-dispatching the same
-   revision does overwrite it, which is why a fix ships as `r2` rather than as a
-   second `r1`. The floating `8.1-fpm` moves to the fixed build — which is how someone who
-   pinned the minor tag gets the fix without editing anything, and why someone who
-   pinned `8.1.34-r1-fpm` has to move to `8.1.34-r2-fpm`.
-   The git tag is not part of this: `v1.0.0`-style tags mark source releases, and a
-   source release tag must exist on the commit the run dispatches from, but it does
-   not name the PHP version or the revision.
+   are never moved, so the build you reported keeps its own name and digest while
+   the floating `8.1-fpm` moves to the fixed one: a deployment that pinned the minor
+   tag receives the fix without editing anything, and one that pinned
+   `8.1.34-r1-fpm` has to move to `8.1.34-r2-fpm`. Which revision a fix ships under,
+   and how the run that publishes it is dispatched, is
+   [MAINTAINING.md](MAINTAINING.md) ("Publishing images").
 
 ## OS package CVEs (the Debian base)
 
@@ -75,7 +120,8 @@ apt traded away for a dependency.
 
 What we do not claim: that a refreshed base is a fixed base. On 2026-11-02 the
 bookworm candidate set moved `tzdata 2026e -> 2026f` and nothing else; the bullseye
-archive reported `0 upgraded` because it is frozen (its LTS window ended 2026-08-31).
+archive reported `0 upgraded` because it is frozen (bullseye reached the end of its
+Debian LTS window on 2026-08-31).
 So for a finding against this kit's images there are exactly three real outcomes, and
 we publish which one applies:
 
@@ -126,144 +172,32 @@ in the pinned commit.
   base (bullseye-derived for the openssl11 route, bookworm-derived for openssl3)
 - OpenSSL: https://openssl-library.org/news/vulnerabilities/
 
-## This kit's own hardening gates (what CI enforces)
+## What the pipeline guarantees
 
-- Manifests must pin the base image by digest and the source by commit. The
-  digest has to be 64 lowercase hex — `@sha256:REPLACE_WITH_DIGEST` merely
-  looks pinned and `build.sh` rejects it — and `PHP_SRC_COMMIT` has to be a full
-  40-hex SHA, never a branch head. `PHP_SRC_REPO` must be
-  `shivammathur/php-src-backports` for every series; pointing a manifest at
-  official `php/php-src` is refused by `build.sh`, the Dockerfile guard and CI
-  alike, because switching source is a reviewed policy change rather than a
-  value to edit.
-- A manifest whose base digest is still a placeholder is *not* a broken build:
-  the per-version CI jobs skip it, and `tools/resolve-base-digest.sh --check`
-  reports what to fill in. Two further advisory reports never gate a build:
-  the same tool warns when a pinned digest no longer matches what the tag now
-  resolves to, and `tools/check-pin-drift.sh` warns when a pinned commit no
-  longer matches the tip of its upstream tag.
-- `PATCHSET_APPROVED=1` is a human decision; unfilled manifests cause builds
-  to skip, never to force-release.
-- A base-image trial cannot publish. `build-version.yml` rejects `push=true`
-  together with `base_image_override` as a hard failure, requires the override to
-  carry a 64-hex digest, and prints which two bases it was offered; the only
-  caller that passes `push=true` is `release.yml`, which never passes the
-  override. A reviewed `BASE_IMAGE` in `manifests/<version>.env` changes only by
-  a human commit — the same rule that keeps `tools/resolve-base-digest.sh` a
-  printer.
-- Every patch under `patches/` must have a review record containing its
-  current SHA-256; mismatches fail CI.
-- The vendored `docker-php-ext-*` scripts must match `docker-php-ext/SHA256SUMS`
-  and the commit pinned in the Dockerfile must be the one recorded in
-  `docker-php-ext/README.md`.
-- The Composer installer is fetched from an immutable git commit and must match
-  a pinned SHA-256; the installed phar is digest-verified too, and the resulting
-  image must still report the recorded version. Composer pins are checked for
-  agreement across the Dockerfile, `build.sh`, CI, the docs and `SUPPORTED.md`,
-  and Composer 2.x is rejected on PHP 5.6/7.0/7.1. A non-blocking job warns when
-  upstream rotates the installer away from the pin.
-- Build dependencies are chosen per OpenSSL route, and the build fails early if
-  the base image's OpenSSL major does not match the route the manifest declares
-  (`openssl11` ⇒ 1.1.x, `openssl3` ⇒ 3.x). A wrong base therefore cannot
-  produce a "successful" image linked against an unexpected library.
-- An image cannot be produced unless `verify-build` passes in the build stage
-  (every required extension present in `php -m`, resolvable via `php --ri`,
-  linked OpenSSL matching the route, and the 8.0.13 / 8.1.0 native-OpenSSL-3
-  floors) and `verify-runtime` passes in the final stage (binaries execute,
-  provenance present, Composer phar still equal to its recorded SHA-256, no
-  unresolved shared libraries). Both scripts are covered by
-  `tests/verify-harness.sh`, so a weakened assertion fails CI even though the
-  image build itself is never exercised there.
-- Every place where build behaviour depends on the PHP series carries a
-  `# version-branch: <tag>` marker and must have a matching row in the
-  "Version-conditional behaviour" table in [MAINTAINING.md](MAINTAINING.md).
-  `tools/list-version-branches.sh --check`
-  fails CI in both directions, so per-version divergence cannot accumulate
-  undocumented — which matters because "backport coverage does not transfer
-  between minor versions".
-- Pushes to registries are only possible from `main`/`master`, only through
-  `release.yml`, and only from a manual dispatch: it is the sole caller
-  that passes `push=true` to the reusable build job. The required `version` input
-  names the PHP series, or `all` for every supported series at once, and the
-  required `revision` input is the image revision every published exact name
-  carries. Each run publishes exactly the series it selects — the one the input
-  names, or all eight for an
-  `all` dispatch — and its validate job fails the
-  run if a selected series' manifest is not pinned and approved, so a mistargeted
-  release cannot end as a green run that published nothing, and a full release with
-  one unreviewed series pushes nothing at all. `build-and-verify.yml` runs
-  on `pull_request` and manual dispatch, never on a push, and always calls that
-  job in test mode — so no PR, fork or branch push can reach a registry login.
-- Publishing also requires tagged source. `release.yml` checks out the full tag
-  history and its guard refuses a dispatched commit that carries no `vX.Y.Z` source
-  release tag; the callee independently refuses `push=true` unless `source_release`
-  names one, and it only publishes from `main`/`master` — never from a tag ref.
-  A git tag marks source and nothing else: it selects no PHP version (that is the
-  dispatch input and the manifest's `SOURCE_REF`), carries no image revision, and
-  appears in no image name, so one tag covers a release of eight series and there is
-  no tag shape that can be mistyped into building the wrong one. Release tags are
-  never moved or deleted, and the registry's `-r<N>` namespace is the append-only
-  history of builds. The pipeline publishes no `latest` tag at
-  all — the two names a run writes are the immutable
-  `<full-php-version>-r<revision>-<variant>` and
-  `<minor>-<variant>` — so no input or tag can move a `latest` for a series you did
-  not release.
-- The Docker Hub mirror secret is used for more than a registry login now.
-  `DOCKERHUB_TOKEN` must be a read+write personal access token, because
-  `tools/sync-dockerhub-readme.sh` (once per release, by `release.yml`'s
-  `mirror-readme` job, and by
-  `sync-dockerhub-readme.yml`) PATCHes the mirror repository's `full_description`
-  so its Overview matches README.md. The blast radius of that wider scope is
-  bounded the same way the rest of the pipeline is: the write happens only in a job
-  that already has the mirror secrets, i.e. never for a `pull_request`, a fork or a
-  branch push; it changes documentation text on one Hub repository and cannot move,
-  sign or delete an image tag; the payload is README.md's own bytes with its
-  relative links rewritten, so nothing the workflow knows about the token is in it;
-  and the token is passed to curl through files in a `mktemp -d` rather than argv,
-  so it does not land in a log or a process list. What it *can* do if abused is
-  deface the mirror's Overview, which is why the read-back is part of the step: a
-  silent failure would look like a synced page.
-- Published images embed `/opt/php/BUILD-PROVENANCE` and OCI provenance
-  labels; release pushes attach provenance/SBOM attestations.
-- The Debian layer of the image is refreshed, inventoried and gated. Both stages
-  run `apt dist-upgrade` against the pinned base before installing anything, with
-  `APT::Get::Always-Include-Phasing=experimental` (so a fix still in partial phasing
-  is taken) and noninteractive conffile handling — and the upgrade is *simulated
-  first*: if it would remove any package the build stops rather than letting apt drop
-  `libcurl4`/`libssl3` to satisfy a dependency. The final stage writes
-  `/opt/php/RUNTIME-OS-PACKAGES` (every installed package by source name and version)
-  and `verify-runtime` re-derives it from `dpkg` on a pulled image, failing on a
-  recorded package that is absent, an unrecorded package that is present, a version
-  that differs, a missing `format=` header or an empty file; images predating the
-  inventory are announced, not failed. `tests/verify-harness.sh` drives each of those
-  paths with a stub `dpkg-query`, and `tests/scan-image-harness.sh` drives the gate's
-  verdicts with a stub `docker` and a stub `trivy`.
-- Every build leg then runs `tools/scan-image.sh` over the image it produced, **before**
-  anything is pushed, and classifies scanner findings against
-  `manifests/OS-CVE-STATUS.md`: a CVE the image's own Debian suite could have fixed is a
-  `fixable` failure (the remedy is a rebuild, not a register row), a finding naming no
-  Debian package in the image is routed to `manifests/SECURITY-REVIEW.md`, and an
-  unregistered or stale-evidence finding fails the leg. The register is the only way a
-  finding stops gating, and a disposition the tool does not recognise is rejected — so
-  there is no ignore list to quietly widen. When the currency probe cannot run the
-  finding is reported `unverified`, never clean. The scanner itself is fetched by
-  `tools/install-trivy.sh` at a pinned version whose release asset must match a
-  committed SHA-256, and the installed binary is re-checked against that version before
-  the gate runs. If no scanner reaches the gate — an unfilled digest, a trivy that
-  cannot reach its database, a scanner that writes a zero-byte report — the verdict is
-  `unverified` and the leg fails: an image nobody scanned is not an image with no CVEs,
-  and the JSON report says which of the three it was (`"scanner":"absent"` /
-  `"trivy-failed"` / `"empty-report"`). A report is read as JSON only when the file
-  actually begins with `{` and jq can parse it, and a line is treated as a record only
-  when a CVE id precedes its first `|`; anything else is mined for CVE ids and reported
-  as package-less. Both rules exist because run 41568823708 showed the alternative: a real
-  report read as text invented 318 findings out of 25 and named no packages at all.
-- The image-size cleanup removes build residue (`.git`, PHPT `tests/`, PECL and
-  apt caches, `/tmp`) but no audit evidence: repo/ref/commit, the effective
-  build package list, PECL and Composer pins, patch digests and the
-  before/after source-tree sizes stay in `/opt/php/BUILD-*`, and
-  `verify-runtime` re-checks on a pulled image that whatever the manifest said
-  about shipping the source tree is what the image actually contains. Slimming
-  is therefore never a way to lose traceability — and a cleanup change that
-  deletes something `docker-php-ext-install` needs fails the build rather than
-  shipping an image whose extension builds are broken.
+Each row is a policy claim: something a deployer or an auditor may rely on, with
+no description of how it is enforced. The mechanism — the step, the tool, the
+flag, and the harness that pins it — is
+[MAINTAINING.md](MAINTAINING.md) ("Hardening gates (what CI enforces)"), which
+carries one bullet per row under the same name. `tools/check-image-name.sh`
+compares the two lists in both directions, so a guarantee with no gate behind it
+and a gate no guarantee claims both fail CI. This table cannot quietly grow a
+claim the pipeline does not enforce, and a new gate cannot ship unclaimed.
+
+| Guarantee | What it claims | Enforced by (MAINTAINING.md) |
+| --- | --- | --- |
+| Manifest pins are shapes, not intentions | No image is built from a floating ref or a digest that merely looks pinned: the base is pinned by 64-hex digest, the source by a full commit, and the source repository is the reviewed fork. | *Building the images yourself* |
+| Unapproved manifests skip, never force-release | An unreviewed series is never published by accident; a series whose manifest is unfilled or unapproved is a skipped build, not a forced release. | *CI (GitHub Actions)* |
+| A base-image trial cannot publish | Experimenting with a candidate base cannot reach a registry, even when a caller asks it to. | *Trialing a newer Debian release* |
+| A patch ships only with its review record | What ships is the bytes a human looked at — and the hash is not the review itself, which is why limit 4 above distinguishes the two. | *Hardening gates* |
+| Vendored extension scripts are hash-verified | The scripts that add extensions to your image, here and downstream, are the reviewed upstream ones. | *Hardening gates* |
+| Composer is fetched and verified by digest | The dependency installer inside the image is pinned twice over, and a legacy series cannot silently receive a version it cannot run. | *Composer trust model* |
+| The base cannot disagree with the OpenSSL route | A wrong base fails the build rather than shipping PHP linked against a library nobody declared. | *Hardening gates* |
+| Nothing is published that failed verify-build or verify-runtime | Every promised extension is present, loadable and linked as declared, and the provenance inside the image is there — as build preconditions, not post-release hopes. | *Build & verification order* |
+| Per-version behaviour is enumerated or CI fails | A rule that applies to one series only is documented in the maintainer inventory or the build is refused, so per-version divergence cannot accumulate silently. | *Version-conditional behaviour* |
+| No pull request or branch push can reach a registry | Review is not a path to publishing an image: only a human dispatching the release workflow from the default branch is. | *CI (GitHub Actions)* |
+| Publishing requires tagged source | Every published image comes from a commit marked as a source release, and a git tag is never a PHP version or an image revision. | *Publishing images* |
+| The Hub token writes documentation text only | The one secret with a scope wider than a registry login changes the mirror repository's `full_description` and nothing else: it cannot move, sign or delete an image tag, and it is never used for a pull request or a fork. | *The Docker Hub mirror's Overview* |
+| Every published image carries its provenance | What an image is made of is checkable where it runs: `/opt/php/BUILD-PROVENANCE`, matching OCI labels, and attestations attached to the released manifest list. | *Publishing images* |
+| The Debian layer is refreshed, inventoried and self-checking | The OS closure is upgraded before anything is installed, is never allowed to trade away a security library, and re-counts itself against its own package inventory on a pulled image. | *The Debian base and its CVEs* |
+| An OS finding is fixed, registered, or it fails the build | There is no ignore list to widen: a finding the image's own suite could have fixed fails the build, and a finding it cannot is published with its evidence and its review date. | *The Debian base and its CVEs* |
+| Slimming the image never loses audit evidence | A smaller image is not a less auditable one, and a cleanup that breaks extension builds fails rather than ships broken. | *How the image stays slim without losing the audit trail* |

@@ -6,68 +6,103 @@
 Read [DISCLAIMER.md](DISCLAIMER.md) and [SECURITY.md](SECURITY.md) before using
 any image from this project. A row below being filled in does **not** mean the
 version is secure; it means the pins and review statuses recorded in this
-repository at generation time.
+repository at generation time. This page is state and nothing else: why a pin
+or a base was chosen is in `manifests/SECURITY-REVIEW.md` and
+[manifests/OS-CVE-STATUS.md](manifests/OS-CVE-STATUS.md), and how a build or a
+release run works is in [MAINTAINING.md](MAINTAINING.md).
 
-| Version | OpenSSL route | Source repo | Variants | Composer | Base image | Patches | Security review | Extensions |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 5.6 | openssl11 | shivammathur/php-src-backports | cli fpm | 1.10.28 | pinned by digest | approved | tested-in-CI | openssl curl mysqli pdo_mysql mbstring zip gd zlib mcrypt apcu redis memcached |
-| 7.0 | openssl3 | shivammathur/php-src-backports | cli fpm | 1.10.28 | pinned by digest | approved | tested-in-CI | openssl curl mysqli pdo_mysql mbstring zip gd zlib mcrypt apcu redis memcached |
-| 7.1 | openssl3 | shivammathur/php-src-backports | cli fpm | 1.10.28 | pinned by digest | approved | tested-in-CI | openssl curl mysqli pdo_mysql mbstring zip gd zlib mcrypt apcu redis memcached |
-| 7.2 | openssl3 | shivammathur/php-src-backports | cli fpm | 2.11.0 | pinned by digest | approved | tested-in-CI | openssl curl mysqli pdo_mysql mbstring zip gd zlib apcu redis memcached |
-| 7.3 | openssl3 | shivammathur/php-src-backports | cli fpm | 2.11.0 | pinned by digest | approved | tested-in-CI | openssl curl mysqli pdo_mysql mbstring zip gd zlib apcu redis memcached |
-| 7.4 | openssl3 | shivammathur/php-src-backports | cli fpm | 2.11.0 | pinned by digest | approved | tested-in-CI | openssl curl mysqli pdo_mysql mbstring zip gd zlib apcu redis memcached |
-| 8.0 | openssl3 | shivammathur/php-src-backports | cli fpm | 2.11.0 | pinned by digest | approved | tested-in-CI | openssl curl mysqli pdo_mysql mbstring zip gd zlib apcu redis memcached |
-| 8.1 | openssl3 | shivammathur/php-src-backports | cli fpm | 2.11.0 | pinned by digest | approved | tested-in-CI | openssl curl mysqli pdo_mysql mbstring zip gd zlib apcu redis memcached |
+| Version | OpenSSL route | Debian base | Base pin | Source repo | Variants | Composer | Patches | Security review | Extensions |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 5.6 | openssl11 | debian:bullseye-slim | pinned by digest | shivammathur/php-src-backports | cli fpm | 1.10.28 | approved | tested-in-CI | openssl curl mysqli pdo_mysql mbstring zip gd zlib mcrypt apcu redis memcached |
+| 7.0 | openssl3 | debian:bookworm-slim | pinned by digest | shivammathur/php-src-backports | cli fpm | 1.10.28 | approved | tested-in-CI | openssl curl mysqli pdo_mysql mbstring zip gd zlib mcrypt apcu redis memcached |
+| 7.1 | openssl3 | debian:bookworm-slim | pinned by digest | shivammathur/php-src-backports | cli fpm | 1.10.28 | approved | tested-in-CI | openssl curl mysqli pdo_mysql mbstring zip gd zlib mcrypt apcu redis memcached |
+| 7.2 | openssl3 | debian:bookworm-slim | pinned by digest | shivammathur/php-src-backports | cli fpm | 2.11.0 | approved | tested-in-CI | openssl curl mysqli pdo_mysql mbstring zip gd zlib apcu redis memcached |
+| 7.3 | openssl3 | debian:bookworm-slim | pinned by digest | shivammathur/php-src-backports | cli fpm | 2.11.0 | approved | tested-in-CI | openssl curl mysqli pdo_mysql mbstring zip gd zlib apcu redis memcached |
+| 7.4 | openssl3 | debian:trixie-slim | pinned by digest | shivammathur/php-src-backports | cli fpm | 2.11.0 | approved | tested-in-CI | openssl curl mysqli pdo_mysql mbstring zip gd zlib apcu redis memcached |
+| 8.0 | openssl3 | debian:trixie-slim | pinned by digest | shivammathur/php-src-backports | cli fpm | 2.11.0 | approved | tested-in-CI | openssl curl mysqli pdo_mysql mbstring zip gd zlib apcu redis memcached |
+| 8.1 | openssl3 | debian:trixie-slim | pinned by digest | shivammathur/php-src-backports | cli fpm | 2.11.0 | approved | tested-in-CI | openssl curl mysqli pdo_mysql mbstring zip gd zlib apcu redis memcached |
+
+How to read a row. `Debian base` is the OS the image is built on and `Base
+pin` says whether that ref is pinned by digest -- a placeholder or an unpinned
+ref is stated as it is, never rounded up to "pinned". `Source repo` is the
+source of record the manifest points at, `Variants` what a release publishes
+for the series, and `Composer` the release the image installs. `Patches` is
+the human patchset decision (`PATCHSET_APPROVED=1` reads `approved`); a row
+reading `pending review` is never built or published. `Security review` is
+the status recorded in `manifests/SECURITY-REVIEW.md`: `tested-in-CI` means
+the image passes the project's CI build and runtime checks, which is not an
+approval and not a claim that a tag exists. Whether a tag exists is answered
+only by "What the registry serves right now" below.
+
+## Upstream end of life
+
+Every series above is end-of-life upstream: `php/php-src` stopped releasing for
+these lines, which is why the source of record is a backports fork and not PHP
+itself. The dates are php.net's own record (its unsupported-versions table plus
+each series' changelog and news archive, read 2026-11-05) and they are closed
+facts, so they are stored here rather than fetched at generation time.
+
+| Series | Last official release | Released | Announced end of life | Pinned here |
+| --- | --- | --- | --- | --- |
+| 5.6 | `5.6.40` | 2019-01-10 | 2018-12-31 | `5.6.40` |
+| 7.0 | `7.0.33` | 2018-12-06 | 2019-01-10 | `7.0.33` |
+| 7.1 | `7.1.33` | 2019-10-24 | 2019-12-01 | `7.1.33` |
+| 7.2 | `7.2.34` | 2020-10-01 | 2020-11-30 | `7.2.34` |
+| 7.3 | `7.3.33` | 2021-11-18 | 2021-12-06 | `7.3.33` |
+| 7.4 | `7.4.33` | 2022-11-03 | 2022-11-28 | `7.4.33` |
+| 8.0 | `8.0.30` | 2023-08-03 | 2023-11-26 | `8.0.30` |
+| 8.1 | `8.1.34` | 2025-12-18 | 2025-12-31 | `8.1.34` |
+
+The release and EOL columns are not in order on every row, and that is what
+php.net published: 5.6's end of life was announced on 2018-12-31 and `5.6.40`
+arrived on 2019-01-10, while `7.0.33` came on 2018-12-06, before 7.0's announced
+end of life on 2019-01-10, with nothing after it. "Pinned here" is this
+repository's own `PHP_VERSION`, read from the manifest at generation time --
+every series sits on php.net's final release today, and a row that stops saying
+so means the pin is behind it.
 
 ## Composer
 
-The Composer column shows the pinned release each image installs. Composer
+The Composer column is the release each image installs. Composer
 2.x requires PHP >= 7.2.5, so PHP 5.6/7.0/7.1 stay on the final 1.x release
-(1.10.28). The installer script is fetched from an immutable git commit and
-digest-verified, and the installed phar is digest-verified too; both digests
-are recorded in `/opt/php/BUILD-PROVENANCE`. See MAINTAINING.md
-("Composer trust model") for the full trust model and how to override the pin.
+(1.10.28) and 7.2–8.1 ship 2.11.0. A manifest that overrides the policy pin
+without also pinning a digest is labelled as unverified in its row. Where
+those two numbers come from and how the built image verifies them is
+MAINTAINING.md ("Composer trust model"); the digests themselves are recorded
+in `/opt/php/BUILD-PROVENANCE` inside the image.
 
 ## Release tags
 
-Published images are `ghcr.io/muffetlab/php` (the release workflow's
-registry/namespace inputs compose `<registry>/<namespace>/php`; a fork passes
-its own namespace) and carry:
+Published images are `ghcr.io/muffetlab/php`, and a release writes two names
+per series and variant -- no third name, and no other registry:
 
-- `ghcr.io/muffetlab/php:<minor>-<variant>` — recommended deploy tag; moves only within its own series
-- `ghcr.io/muffetlab/php:<full-php-version>-r<revision>-<variant>` — immutable exact tag; `8.1.34-r1-fpm` is the first image built from PHP 8.1.34, `8.1.34-r2-fpm` the rebuild after an OS CVE fix
+- `ghcr.io/muffetlab/php:<minor>-<variant>` — the recommended deploy tag; it floats, and only within its own series
+- `ghcr.io/muffetlab/php:<full-php-version>-r<revision>-<variant>` — the immutable exact tag; `8.1.34-r1-fpm` is the first image built from PHP 8.1.34, `8.1.34-r2-fpm` the next build of it
 
-Four things each carry one job, and none of them is "which PHP version to
-build": a git tag (`v1.0.0`) marks the source commit a release was made from,
-the workflow_dispatch `version` input picks the scope (`all` or one series),
-`manifests/<series>.env` holds the PHP version, and the Docker tag names the
-image that came out. Adding a series is a new manifest plus a new row in the
-allowlist -- the release mechanism does not change.
+There is no `latest` tag published for any variant: neither name above is one, and
+`<minor>-<variant>` is the only name that moves -- it cannot change major
+version. Choose the series from the table above.
+MAINTAINING.md ("Publishing images") holds the rest of the model: why no
+`latest` is published, what each of the four release inputs carries, and how a
+run decides which series to build.
 
-There is no `latest` tag, and none is published for any variant: a release run
-publishes the series it selects -- one series for a single-series dispatch,
-every supported series at once for `version=all` -- so a `latest` name
-would resolve to whichever series was released last: not the newest, and an
-unrelated rebuild of one series could move it backwards. `<minor>-<variant>` is
-the only floating name and it cannot change major version. Choose the series
-from the table above; MAINTAINING.md ("Publishing
-images") records why.
+Exact tags are never moved, so the highest revision the registry serves is also
+the newest image: a deployment that pinned an exact name has to move to a newer
+revision -- or to `<minor>-<variant>` -- to receive a fix.
 
-Every name above is written by one release run -- a manual dispatch of
-`release.yml` that names the scope (`all` or a series) and the image revision,
-from a commit that carries a `vX.Y.Z` source release tag. Both names are
-written by the same run for each series it publishes.
+### What the registry serves right now
 
-Which tags exist is a live registry fact: this generator reads `/tags/list`
-with an anonymous pull-scope token and records what it answers, at the
-time stamped below. A series appears when the registry serves its
-variants; for each variant the row names the floating tag and the exact
-tag with the highest image revision the registry serves, and the two must
-resolve to the same digest (an older revision for the same version may
-still be in the registry as the snapshot it is, and is not compared). The
-generator fails the run if they do not:
+Which tags exist is a registry fact, not a repository one, so this section is
+the registry's own answer to the question, read at the time stamped below. A
+series appears when the registry serves its variants; for each variant the row
+names the floating tag, the exact tag of the highest image revision, and the
+digest both names resolve to. A series with no row here has not been published
+by a release run that selected it -- a complete, approved manifest is a
+precondition for a release, not a claim that one happened.
 
-<!-- generated at 2026-11-04T15:16:53Z -->
+What it answered, per series and variant:
+
+<!-- generated at 2026-11-06T00:28:38Z -->
 - 7.0: `cli` `7.0-cli` / `7.0.33-cli` → `sha256:e0803ef8dafcb942a1c2ccdec3f74e185ea7775f56ba2084104b36a2aedd4180`, `fpm` `7.0-fpm` / `7.0.33-fpm` → `sha256:d258bc3b271145ed7d4cc568f800effb27f05016b1c3c42cd06b616d1da68dee`
 - 7.1: `cli` `7.1-cli` / `7.1.33-cli` → `sha256:9c5b838338a3f33e588b9d62a0abde268bee7dc198f30f4ccbc28c6628833440`, `fpm` `7.1-fpm` / `7.1.33-fpm` → `sha256:b7ed1e71f1bb8f24d6a05cce22f992adf7bba0b74972a3c86ceb1cf063594f0e`
 - 7.2: `cli` `7.2-cli` / `7.2.34-cli` → `sha256:a1865f96a8355ba01a0248c4cea12b9437c41e12f3e08d52e0d05cde1146ea31`, `fpm` `7.2-fpm` / `7.2.34-fpm` → `sha256:cc57e47f79691a5b3d9f380637a3fc6a77159fd3f9573eb9916ef68e9b48d687`
@@ -76,42 +111,22 @@ generator fails the run if they do not:
 - 8.0: `cli` `8.0-cli` / `8.0.30-cli` → `sha256:9bf17071e6e1e4802f0906e57fa7dc1445c672ecbd4565e879b95fe6093f9a45`, `fpm` `8.0-fpm` / `8.0.30-fpm` → `sha256:867fc65dab7add2220b99b9c614e274c17e9ae19be18ad22399d8baefaff8b0b`
 - 8.1: `cli` `8.1-cli` / `8.1.34-cli` → `sha256:5d0f628b4205839f6b664c23f66712e7ba7eccf5f7d1042f031d38b46b9aa36f`, `fpm` `8.1-fpm` / `8.1.34-fpm` → `sha256:011d26068187d4501e7cd65094c01259de0cdf9228338079b4e3a5ab5948ee54`
 
+The same list holds no other name: what the registry answered at the timestamp
+above is exactly the two names per series and variant printed here. That is read,
+not asserted -- a `latest`-shaped name stops this generator, and any other name
+outside these two shapes would be listed rather than left out.
+
 Each tag is a multi-arch manifest list covering `linux/amd64` and
 `linux/arm64`; `docker pull` selects the matching platform automatically.
 There are no architecture-suffixed tags.
 
-The OpenSSL route is not part of a tag name: the release pipeline fixes one
-route per series (5.6 -> `openssl11`, everything else -> `openssl3`), so a
-suffix could not express a choice. It is in `BUILD-PROVENANCE` and the
-`dev.php-legacy.openssl-route` label instead, and the per-version table above
-lists it.
+The OpenSSL route is not part of a tag name either: one route is fixed per
+series, so a suffix could express no choice a deployment makes. The
+`OpenSSL route` column above is the answer, and the image carries it in
+`/opt/php/BUILD-PROVENANCE` and the `dev.php-legacy.openssl-route` label.
 
-Exact tags are never moved, and there is one per image built from a PHP
-version: `8.1.34-r1-cli` is the first, and `8.1.34-r2-cli` the rebuild that
-carries an OS security fix -- the PHP version did not change, the image
-revision did. Reading the highest revision out of the registry is therefore
-the same as reading the newest image, and a deployment can pin an exact name
-knowing it will always mean the bytes it was first pushed as. The name that
-moves is `<minor>-<variant>`, which every release run repoints at that run's
-build, so a deployment that pinned an exact name has to move to the newer
-revision (or to `<minor>-<variant>`) to receive a fix.
-
-A git tag is not part of an image name and does not pick a PHP version:
-`v1.0.0` marks the source commit a release was made from, and a run refuses
-to publish from a commit that carries no such tag.
-
-Every published image embeds `/opt/php/BUILD-PROVENANCE` (base image digest,
-source repo/ref/commit, OpenSSL route and version, PECL extension pins,
-Composer version + phar digest, patch tree SHA-256 list, build date) plus
-`/opt/php/BUILD-DEPS` and `/opt/php/BUILD-CLEANUP` (the effective build package
-list, and whether the PHP source tree was shipped and what it weighed), and
-matching OCI labels; release pushes attach provenance/SBOM attestations where
-the registry supports them.
-
-Only rows whose manifest is fully pinned **and** `PATCHSET_APPROVED=1` are ever
-built and published. A release run publishes the series it selects -- one for a
-single-series dispatch, all supported series for a `version=all`
-dispatch -- and a selected series whose manifest is unpinned or unapproved fails
-the whole run rather than publishing part of a release quietly; a full release
-checks every selected manifest before it pushes any image.
-Series a release did not select are skipped, not force-released.
+Every row above is a claim about an image, and every claim is checkable in the
+image: [DEPLOYING.md](DEPLOYING.md) ("Checking what an image actually
+contains") names the files to read, and
+[MAINTAINING.md](MAINTAINING.md) ("Publishing images") records what writes them
+and what is attested to the registry.

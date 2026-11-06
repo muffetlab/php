@@ -1,10 +1,10 @@
 # Maintaining this kit
 
-[README.md](README.md) is written for people who **pull** these images. This
-file is for the much smaller audience that builds or publishes them: filling
-manifests, reviewing patchsets, running the CI chain, cutting a source release tag
-and dispatching a release, and
-understanding why the gates are shaped the way they are.
+[README.md](README.md) and [DEPLOYING.md](DEPLOYING.md) are written for people who
+**pull** these images. This file is for the much smaller audience that builds or
+publishes them: filling manifests, reviewing patchsets, running the CI chain,
+cutting a source release tag and dispatching a release, and understanding why the
+gates are shaped the way they are.
 
 Nothing here changes an image. The published address, the tag scheme and the
 review gates are the same whether or not you read this file; what you are
@@ -26,6 +26,7 @@ what "reviewed" means, and this file assumes you will not weaken either.
 - [How the image stays slim without losing the audit trail](#how-the-image-stays-slim-without-losing-the-audit-trail)
 - [The Debian base and its CVEs](#the-debian-base-and-its-cves)
 - [CI (GitHub Actions)](#ci-github-actions)
+- [Hardening gates (what CI enforces)](#hardening-gates-what-ci-enforces)
 - [Publishing images](#publishing-images)
 - [Why this kit doesn't auto-pick latest commits](#why-this-kit-doesnt-auto-pick-latest-commits)
 - [Repository layout](#repository-layout)
@@ -44,8 +45,9 @@ That last field can only be resolved against a registry: run
 same as proven — the first release run on a changed base is the proof.
 
 5.6 is buildable and has been built and tested (2026-10-31, cli and fpm). Its
-base, Debian bullseye, left LTS on 2026-08-31 and its `-security` pool no longer
-serves the `.debs` its own index still lists, so both apt stages of the Dockerfile
+base, Debian bullseye, reached the end of its Debian LTS window on 2026-08-31,
+and its `-security` pool no longer serves the `.debs` its own index still
+lists, so both apt stages of the Dockerfile
 rewrite that one suite to `archive.debian.org` — keyed on the base reporting
 Debian 11, followed by a `grep` assertion, and catalogued as the
 `bullseye-archive-security` version-branch. Nothing else is redirected, so the
@@ -72,9 +74,10 @@ for both architectures and the rebuild evidence are in
    digest is the same class of security decision as choosing a source commit, so
    a human pastes the line and commits it. Confirm the tag you resolved to is
    the maintained one for the route. For `openssl3` that means bookworm-derived.
-   For `openssl11` there is no maintained Debian release shipping OpenSSL 1.1 any
-   more — bullseye's LTS window closed on 2026-08-31 — which is why 5.6's pinned
-   digest is a deliberate freeze rather than a track-the-maintained-tag choice.
+   For `openssl11` there is no maintained Debian release shipping OpenSSL 1.1
+   any more — bullseye reached the end of its Debian LTS window on 2026-08-31 —
+   which is why 5.6's pinned digest is a deliberate freeze rather than a
+   track-the-maintained-tag choice.
 2. Optionally tighten the per-version fields:
    - `BUILD_PACKAGES` — pinned build-time package list; replaces the route
      default entirely, so it must include the toolchain and every `-dev`
@@ -156,7 +159,7 @@ Run `./tools/list-version-branches.sh` for the current tag → file:line index.
 | --- | --- | --- |
 | `series-allowlist` | all | The set of series this kit will build at all; must stay in step with `manifests/*.env` and the `SECURITY-REVIEW.md` status table. |
 | `route-by-series` | 5.6 vs 7.0+ | 5.6 is pinned to the `openssl11` route; every other series requires `openssl3` (the backported OpenSSL 3 work is const-level compile compatibility, verified against the pinned branches). Enforced in `build.sh` and again in the Dockerfile. |
-| `bullseye-archive-security` | 5.6 (by base OS, not by PHP series) | Debian bullseye left LTS on 2026-08-31: its `bullseye-security` index is still published but the pool 404s from `deb.debian.org` (measured for both arm64 and amd64), while `archive.debian.org` serves the same files. Both apt stages therefore rewrite the security suite in `/etc/apt/sources.list` to the archive, keyed on `/etc/os-release` `VERSION_ID=11` and followed by a `grep` assertion so a base that stops keeping its sources in that file fails here rather than as a mid-build 404. No other base matches, so the `openssl3` route is untouched. The rewrite happens in the runtime stage too, so it is baked into the published image and users can `apt-get update` and install from the archive. Cost: 1.1.1w-0+deb11u8 forever. If `deb.debian.org` also retires bullseye *main* — it still serves it today — the same one-line sed has to cover `deb.debian.org/debian` as well. |
+| `bullseye-archive-security` | 5.6 (by base OS, not by PHP series) | Debian bullseye reached the end of its Debian LTS window on 2026-08-31: its `bullseye-security` index is still published but the pool 404s from `deb.debian.org` (measured for both arm64 and amd64), while `archive.debian.org` serves the same files. Both apt stages therefore rewrite the security suite in `/etc/apt/sources.list` to the archive, keyed on `/etc/os-release` `VERSION_ID=11` and followed by a `grep` assertion so a base that stops keeping its sources in that file fails here rather than as a mid-build 404. No other base matches, so the `openssl3` route is untouched. The rewrite happens in the runtime stage too, so it is baked into the published image and users can `apt-get update` and install from the archive. Cost: 1.1.1w-0+deb11u8 forever. If `deb.debian.org` also retires bullseye *main* — it still serves it today — the same one-line sed has to cover `deb.debian.org/debian` as well. |
 | `patches-by-series` | all | Extra patches are read from `patches/<series>/`, so a backport can never leak into a series it was not reviewed for. |
 | `mysqlnd-suffix` | 8.0+ | `--with-mysqli=mysqlnd` / `--with-pdo-mysql=mysqlnd` lost the `=mysqlnd` suffix in 8.0; earlier series pass it explicitly. |
 | `gd-zip-spelling` | 5.6–7.1, 7.2–7.3, 7.4+ | Three different GD/ZIP flag spellings: system libzip + `--with-gd --with-png-dir`; then `--with-png-dir` and `--with-libzip` removed in 7.2; then GD renamed to `--enable-gd --with-jpeg --with-freetype --with-webp` in 7.4. |
@@ -210,6 +213,31 @@ and ship a smaller image than the manifest claims. And it is **verified against
 the promise, not a constant**: `verify-build`, `verify-runtime`, `smoke.sh` and
 `extensions.sh` all read the resolved set, so an image that promised mcrypt and
 lost it fails, and an image that did not promise it and grew one also fails.
+
+How each baseline member is wired still differs by version, and this is the table
+a reviewer reads before touching a configure flag. Extension names are validated
+as `[a-z0-9_]` in `build.sh`, in the Dockerfile guard and in every CI gate that
+reads a manifest, because they are interpolated into build-stage shell.
+
+| Extension | 5.6–7.1 | 7.2–7.3 | 7.4 | 8.0–8.1 |
+| --- | --- | --- | --- | --- |
+| mysqli / pdo_mysql | `=mysqlnd` explicit | `=mysqlnd` explicit | `=mysqlnd` still accepted | bare flags only (`=mysqlnd` removed) |
+| zip | system libzip (`--with-libzip` + `libzip-dev`) | bundled libzip | bundled | bundled |
+| gd | `--with-gd --with-jpeg-dir --with-png-dir --with-freetype-dir` | same minus `--with-png-dir` (removed; libpng automatic) | renamed: `--enable-gd --with-jpeg --with-freetype`, native `--with-webp` | same as 7.4 |
+| mbstring | bundled oniguruma | system oniguruma (`libonig-dev`) | system | system |
+| openssl | OpenSSL 1.1 route; TLS 1.3 only if backported | OpenSSL 3 via backports; TLS 1.3 stream constant only from 7.4 (7.0–7.3 have none) | OpenSSL 3 via backports | native OpenSSL 3 (>= 8.0.13 / >= 8.1.0) |
+| mcrypt | in the core baseline: `ext/mcrypt` + `--with-mcrypt`, dev package `libmcrypt-dev`, runtime `libmcrypt4` | not buildable: removed from core in 7.2 (PECL replacement floors at PHP 7.2.0) — a manifest value here is a build error | not buildable | not buildable |
+| redis (PECL) | 5.6: 4.3.0 (last 5.6 release); 7.0–7.1: 5.3.7 (last with floor 7.0) | 6.0.2 (6.1.0 needs 7.4) | pinned 6.1.0 | pinned 6.1.0 |
+| memcached (PECL) | pinned 2.2.0 + system libmemcached (`libmemcached11` runtime, measured on bullseye) | pinned 3.3.0 + system libmemcached (`libmemcached11` runtime) | same | same |
+| apcu (PECL) | 5.6: 4.0.11 (last of the 4.0.x line, floor 5.3.0) | pinned 5.1.28 (floor 7.0.0-dev, read 2026-11-03) | pinned 5.1.28 | pinned 5.1.28 |
+| composer | pinned 1.10.28 (2.x requires PHP >= 7.2.5) | pinned 2.11.0 | pinned 2.11.0 | pinned 2.11.0 |
+
+PECL pins are bounded by each release's declared floor: `pecl install` refuses a
+series below the `package.xml` `<php><min>`, so the table pins the newest release
+that admits the series — redis 6.1.0 declares PHP >= 7.4.0, which is why 7.0–7.3
+cannot share it. If an application needs an extension outside the standard set
+(`intl`, `bcmath`, `soap`), validate the configure spelling against the same
+boundaries; do not assume one flag list works across all eight versions.
 
 The resolved lists are computed once in the guard step and handed to every later
 step through `/opt/php/BUILD-EXTENSIONS` — read by the build-stage apt step (which
@@ -284,7 +312,7 @@ missing one.
 
    | Version | Route | Base OS requirement |
    | --- | --- | --- |
-   | 5.6 | `openssl11` | an OS shipping OpenSSL 1.1 — in practice Debian bullseye at 1.1.1w, which left LTS on 2026-08-31, so this is a *frozen* choice rather than a maintained one (measured, with the archive-mirror consequences, in `manifests/SECURITY-REVIEW.md`); the pinned commit must contain verified OpenSSL 1.1 compatibility patches |
+   | 5.6 | `openssl11` | an OS shipping OpenSSL 1.1 — in practice Debian bullseye at 1.1.1w, which reached the end of its Debian LTS window on 2026-08-31, so this is a *frozen* choice rather than a maintained one (measured, with the archive-mirror consequences, in `manifests/SECURITY-REVIEW.md`); the pinned commit must contain verified OpenSSL 1.1 compatibility patches |
    | 7.0–7.4 | `openssl3` | maintained OS shipping OpenSSL 3.x (e.g. Debian bookworm-derived); OpenSSL 3 backports verified **for that exact minor version** in the pinned commit |
    | 8.0 | `openssl3` | OpenSSL 3.x base; native support needs >= 8.0.13 (build-enforced, pin is 8.0.30) |
    | 8.1 | `openssl3` | OpenSSL 3.x base; native support (>= 8.1.0, build-enforced, pin is 8.1.34) |
@@ -335,9 +363,16 @@ reviewed change to all three, not a manifest edit.
 
 ## Composer trust model
 
-The per-series version policy that consumers see is in the
-[README](README.md#composer); this is the part that only matters when you are
-changing a pin. All pins were verified against upstream on 2026-10-30:
+The per-series version policy that consumers see is described in
+[DEPLOYING.md](DEPLOYING.md) and in [SUPPORTED.md](SUPPORTED.md) ("Composer");
+this is the part that only matters when you are changing a pin:
+
+| PHP series | Composer pin | Why |
+| --- | --- | --- |
+| 5.6 / 7.0 / 7.1 | **1.10.28** | Final 1.x release (2026-05-13); there is no later 1.10.x. Composer 2.11.0 declares `php: ^7.2.5 \|\| ^8.0`, so it cannot be used here at all. |
+| 7.2 / 7.3 / 7.4 / 8.0 / 8.1 | **2.11.0** | Current stable 2.x (2026-10-29); satisfies the `>= 7.2.5` floor. |
+
+All pins were verified against upstream on 2026-10-30:
 
 - The installer script is fetched from an **immutable git commit**
   (`composer/getcomposer.org` @ `298f4ba7b62708d16c291573e1c52811b5e494bd`,
@@ -409,7 +444,7 @@ the final image, which has no compiler, no `make` and no `git`:
   store, deleted before the copy either way.
 - `*/tests` under the source tree — PHPT suites need `make` plus `cc`, and
   `docker-php-ext-install` never reads them. This is the single biggest
-  removable item in the tree (measured in the README).
+  removable item in the tree (measured in the source-tree table below).
 - `/usr/src/php/.github`, PECL temp/cache contents, `/tmp`, `/var/tmp`, and
   the apt lists and package caches in the runtime stage.
 
@@ -441,17 +476,29 @@ gates — the sensible budget depends on the base image you picked. Pass a
 `size_budget_mb` string to the reusable workflow if you want an explicit
 over/under line in the log.
 
-The measured source-tree numbers in the
-[README](README.md#what-the-image-weighs) are `du` block counts of an un-built
-tree, which is what the Dockerfile deletes before `make`; they are not the
-image's final size. The first real build (5.6 / bullseye / cli, measured on an
+The source-tree numbers below are `du -sk` block counts of fresh `--depth 1`
+checkouts of the two pinned commits — the tree as the Dockerfile finds it, before
+`make` and before the cleanup step, which deletes roughly half of it:
+
+| Pin | Checked-out tree, excluding `.git`/`.github` | `*/tests` (PHPT) | `.github` | Tree left after cleanup |
+| --- | --- | --- | --- | --- |
+| 8.1.34 | 186.0 MB | 97.8 MB | 0.7 MB | ~88.2 MB |
+| 5.6.40 | 143.6 MB | 73.5 MB | ~0 MB | ~70.1 MB |
+
+Those are not the image's final size: the final image carries the *configured and
+built* tree. The first real build (5.6 / bullseye / cli, measured on an
 arm64 host — CI builds both amd64 and arm64, so treat these as the shape of the
 distribution rather than the release numbers) supplied the rest:
 
-- the tree grows to 420.7 MB during `make` and lands at 320.6 MB after the
-  cleanup step, recorded in `/opt/php/BUILD-CLEANUP`;
+- the tree grows to `source_tree_kb_before_cleanup=420736` (420.7 MB) during
+  `make` and lands at `source_tree_kb_after_cleanup=320592` (320.6 MB), recorded
+  in `/opt/php/BUILD-CLEANUP` — the cleanup step does exactly what it records;
+  `tools/report-image-size.sh` reads the same `/usr/src/php` in the finished
+  image and reported 312.8 MB, so the two figures are the build stage's record
+  and the shipped image's measurement of one tree, not two trees;
 - the image is 710.3 MB uncompressed with the tree and 320.5 MB without it
-  (`SHIP_PHP_SOURCE=0`), i.e. the tree really is 44% of the artifact;
+  (`SHIP_PHP_SOURCE=0`): the tree is 312.8 MB of those 710.3 MB, 44% of the
+  artifact, and dropping it buys back roughly 390 MB;
 - of the remaining 320 MB, `/opt/php` is 98.8 MB (84.5 MB of that is
   `bin/php`, which carries the statically compiled extensions) and `/usr/lib`
   is 80.2 MB — the transitive closure of `libcurl4` and `libxml2`
@@ -512,7 +559,8 @@ refresh the pinned filesystem before installing anything into it:
   which OS versions they carry.
 
 On bookworm the refresh moves a handful of packages; on bullseye it is a no-op —
-that archive is frozen (LTS ended 2026-08-31). A refresh is not a promise of a fix:
+that archive is frozen (bullseye reached the end of its Debian LTS window on
+2026-08-31). A refresh is not a promise of a fix:
 on the `openssl11` route it does nothing, and the register below carries the weight.
 
 **What the image says about itself.** The final stage writes
@@ -739,6 +787,173 @@ evidence. If the finding names PHP rather than a Debian package, it belongs in
   asks to publish and is refused must stop the run, not finish green with no image
   behind the tags.
 
+## Hardening gates (what CI enforces)
+
+[SECURITY.md](SECURITY.md) states one line per guarantee — what a deployer or an
+auditor may rely on. This is the other half of the same list: for each guarantee,
+the step, the tool and the flag that enforces it, and the chapter here that
+explains why it is shaped that way. `tools/check-image-name.sh` walks the two
+lists against each other in both directions, so a guarantee no gate backs and a
+gate no guarantee claims both fail CI. The names are the join, which is what makes
+them one agreement rather than two documents that happen to agree today.
+
+- **Manifest pins are shapes, not intentions** — every manifest pins the base image
+  by digest and the source by commit, and the *shapes* are checked, not the intent:
+  the digest has to be 64 lowercase hex, because `@sha256:REPLACE_WITH_DIGEST`
+  merely looks pinned and `build.sh` rejects it; `PHP_SRC_COMMIT` has to be a full
+  40-hex SHA, never a branch head; `PHP_SRC_REPO` must be
+  `shivammathur/php-src-backports` for every series. Pointing a manifest at official
+  `php/php-src` is refused by `build.sh`, the Dockerfile guard and CI alike, because
+  switching source is a reviewed policy change rather than a value to edit.
+- **Unapproved manifests skip, never force-release** — `PATCHSET_APPROVED=1` is a
+  human decision. A manifest whose base digest is still a placeholder is *not* a
+  broken build: the per-version CI jobs skip it and
+  `tools/resolve-base-digest.sh --check` reports what to fill in (see
+  *CI (GitHub Actions)*). Two further reports are advisory and never gate a build:
+  the same tool warns when a pinned digest no longer matches what the tag now
+  resolves to, and `tools/check-pin-drift.sh` warns when a pinned commit no longer
+  matches the tip of its upstream tag.
+- **A base-image trial cannot publish** — `build-version.yml` rejects `push=true`
+  together with `base_image_override` as a hard failure, requires the override to
+  carry a 64-hex digest, and prints which two bases it was offered; the only caller
+  that passes `push=true` is `release.yml`, which never passes the override. A
+  reviewed `BASE_IMAGE` in `manifests/<version>.env` changes only by a human commit —
+  the same rule that keeps `tools/resolve-base-digest.sh` a printer. See *Trialing a
+  newer Debian release*.
+- **A patch ships only with its review record** — the `Patch review record check`
+  step (`build-and-verify.yml`, with its twin in `release.yml`) runs `sha256sum`
+  over every `patches/<version>/*.patch` and fails if that digest is not written
+  verbatim in a `REVIEW-*.md` naming the file, so what ships is the bytes that were
+  looked at. The Dockerfile applies each patch through
+  `patch --batch --forward --dry-run -p1` before applying it, and `BUILD-PROVENANCE`
+  records the digests of the whole `patches/` tree as the build saw it. What the hash
+  cannot carry is the judgement — whether the patch belongs on that target branch, is
+  a correct backport rather than a textual collision, is already in the pinned commit,
+  regresses anything — and that is what a human fills into
+  `patches/REVIEW-TEMPLATE.md` ("Review result", "Test result", "Decision"). Today
+  `patches/<version>/` holds no files for any series, so the reviewed unit is the
+  pinned commit itself and this gate checks nothing; it exists for the day a patch is
+  added, and SECURITY.md's fourth known limit is the policy claim it backs.
+- **Vendored extension scripts are hash-verified** — the `docker-php-ext-*` tools
+  must match `docker-php-ext/SHA256SUMS`, and the commit pinned in the Dockerfile
+  must be the one recorded in `docker-php-ext/README.md`, so the scripts that build
+  extensions into the image — and downstream, in the user's container — are the
+  reviewed ones.
+- **Composer is fetched and verified by digest** — the installer is fetched from an
+  immutable git commit and must match a pinned SHA-256; the installed phar is
+  digest-verified too, and the resulting image must still report the recorded
+  version. Composer pins are checked for agreement across the Dockerfile, `build.sh`,
+  CI, the docs and `SUPPORTED.md`, and Composer 2.x is rejected on PHP 5.6/7.0/7.1. A
+  non-blocking job warns when upstream rotates the installer away from the pin. The
+  trust model and the override knobs are in *Composer trust model*.
+- **The base cannot disagree with the OpenSSL route** — build dependencies are chosen
+  per route, and the build fails early if the base image's OpenSSL major does not
+  match the route the manifest declares (`openssl11` ⇒ 1.1.x, `openssl3` ⇒ 3.x). A
+  wrong base therefore cannot produce a "successful" image linked against an
+  unexpected library.
+- **Nothing is published that failed verify-build or verify-runtime** — an image
+  cannot be produced unless `verify-build` passes in the build stage (every required
+  extension present in `php -m`, resolvable via `php --ri`, linked OpenSSL matching
+  the route, and the 8.0.13 / 8.1.0 native-OpenSSL-3 floors) and `verify-runtime`
+  passes in the final stage (binaries execute, provenance present, Composer phar
+  still equal to its recorded SHA-256, no unresolved shared libraries). Both scripts
+  are covered by `tests/verify-harness.sh`, so a weakened assertion fails CI even
+  though the image build itself is never exercised there.
+- **Per-version behaviour is enumerated or CI fails** — every place where build
+  behaviour depends on the PHP series carries a `# version-branch: <tag>` marker and
+  must have a matching row in the *Version-conditional behaviour* table.
+  `tools/list-version-branches.sh --check` fails CI in both directions, so
+  per-version divergence cannot accumulate undocumented — which matters because
+  "backport coverage does not transfer between minor versions".
+- **No pull request or branch push can reach a registry** — pushes to registries are
+  only possible from `main`/`master`, only through `release.yml`, and only from a
+  manual dispatch: it is the sole caller that passes `push=true` to the reusable
+  build job. The required `version` input names the PHP series, or `all` for every
+  supported series at once, and the required `revision` input is the image revision
+  every published exact name carries. Each run publishes exactly the series it
+  selects, and its validate job fails the run if a selected series' manifest is not
+  pinned and approved — so a mistargeted release cannot end as a green run that
+  published nothing, and a full release with one unreviewed series pushes nothing at
+  all. `build-and-verify.yml` runs on `pull_request` and manual dispatch, never on a
+  push, and always calls that job in test mode.
+- **Publishing requires tagged source** — `release.yml` checks out the full tag
+  history and its guard refuses a dispatched commit that carries no `vX.Y.Z` source
+  release tag; the callee independently refuses `push=true` unless `source_release`
+  names one, and it only publishes from `main`/`master` — never from a tag ref. A git
+  tag marks source and nothing else: it selects no PHP version (that is the dispatch
+  input and the manifest's `SOURCE_REF`), carries no image revision, and appears in no
+  image name, so one tag covers a release of eight series and there is no tag shape
+  that can be mistyped into building the wrong one. Release tags are never moved or
+  deleted, and the registry's `-r<N>` namespace is the append-only history of builds.
+  The pipeline publishes no `latest` tag at all — the two names a run writes are the
+  immutable `<full-php-version>-r<revision>-<variant>` and `<minor>-<variant>` — so no
+  input or tag can move a `latest` for a series you did not release. See *What the tag
+  means, and what it does not*.
+- **The Hub token writes documentation text only** — `DOCKERHUB_TOKEN` must be a
+  read+write personal access token, because `tools/sync-dockerhub-readme.sh` (once
+  per release, by `release.yml`'s `mirror-readme` job, and by
+  `sync-dockerhub-readme.yml`) PATCHes the mirror repository's `full_description` so
+  its Overview matches README.md. The blast radius of that wider scope is bounded the
+  same way the rest of the pipeline is: the write happens only in a job that already
+  has the mirror secrets, i.e. never for a `pull_request`, a fork or a branch push; it
+  changes documentation text on one Hub repository and cannot move, sign or delete an
+  image tag; the payload is README.md's own bytes with its relative links rewritten,
+  so nothing the workflow knows about the token is in it; and the token is passed to
+  curl through files in a `mktemp -d` rather than argv, so it does not land in a log
+  or a process list. What it *can* do if abused is deface the mirror's Overview, which
+  is why the read-back is part of the step: a silent failure would look like a synced
+  page. See *The Docker Hub mirror's Overview*.
+- **Every published image carries its provenance** — published images embed
+  `/opt/php/BUILD-PROVENANCE` and OCI provenance labels, and release pushes attach
+  provenance/SBOM attestations: the merge carries each platform's attestation
+  manifests into the list, a step asserts both platforms are present, and a reporting
+  step counts the attestation manifests the published list actually carries (see
+  *Publishing images*).
+- **The Debian layer is refreshed, inventoried and self-checking** — both stages run
+  `apt dist-upgrade` against the pinned base before installing anything, with
+  `APT::Get::Always-Include-Phasing=experimental` (so a fix still in partial phasing
+  is taken) and noninteractive conffile handling — and the upgrade is *simulated
+  first*: if it would remove any package the build stops rather than letting apt drop
+  `libcurl4`/`libssl3` to satisfy a dependency. The final stage writes
+  `/opt/php/RUNTIME-OS-PACKAGES` (every installed package by source name and version)
+  and `verify-runtime` re-derives it from `dpkg` on a pulled image, failing on a
+  recorded package that is absent, an unrecorded package that is present, a version
+  that differs, a missing `format=` header or an empty file; images predating the
+  inventory are announced, not failed. `tests/verify-harness.sh` drives each of those
+  paths with a stub `dpkg-query`, and `tests/scan-image-harness.sh` drives the gate's
+  verdicts with a stub `docker` and a stub `trivy`. See *The Debian base and its CVEs*.
+- **An OS finding is fixed, registered, or it fails the build** — every build leg runs
+  `tools/scan-image.sh` over the image it produced, **before** anything is pushed, and
+  classifies scanner findings against `manifests/OS-CVE-STATUS.md`: a CVE the image's
+  own Debian suite could have fixed is a `fixable` failure (the remedy is a rebuild,
+  not a register row), a finding naming no Debian package in the image is routed to
+  `manifests/SECURITY-REVIEW.md`, and an unregistered or stale-evidence finding fails
+  the leg. The register is the only way a finding stops gating, and a disposition the
+  tool does not recognise is rejected — so there is no ignore list to quietly widen.
+  When the currency probe cannot run the finding is reported `unverified`, never
+  clean. The scanner itself is fetched by `tools/install-trivy.sh` at a pinned version
+  whose release asset must match a committed SHA-256, and the installed binary is
+  re-checked against that version before the gate runs. If no scanner reaches the gate
+  — an unfilled digest, a trivy that cannot reach its database, a scanner that writes
+  a zero-byte report — the verdict is `unverified` and the leg fails: an image nobody
+  scanned is not an image with no CVEs, and the JSON report says which of the three it
+  was (`"scanner":"absent"` / `"trivy-failed"` / `"empty-report"`). A report is read as
+  JSON only when the file actually begins with `{` and jq can parse it, and a line is
+  treated as a record only when a CVE id precedes its first `|`; anything else is
+  mined for CVE ids and reported as package-less. Both rules exist because run
+  41568823708 showed the alternative: a real report read as text invented 318 findings
+  out of 25 and named no packages at all.
+- **Slimming the image never loses audit evidence** — the image-size cleanup removes
+  build residue (`.git`, PHPT `tests/`, PECL and apt caches, `/tmp`) but no audit
+  evidence: repo/ref/commit, the effective build package list, PECL and Composer pins,
+  patch digests and the before/after source-tree sizes stay in `/opt/php/BUILD-*`, and
+  `verify-runtime` re-checks on a pulled image that whatever the manifest said about
+  shipping the source tree is what the image actually contains. Slimming is therefore
+  never a way to lose traceability — and a cleanup change that deletes something
+  `docker-php-ext-install` needs fails the build rather than shipping an image whose
+  extension builds are broken. See *How the image stays slim without losing the audit
+  trail*.
+
 ## Publishing images
 
 Registry defaults to GHCR and the published image is `ghcr.io/muffetlab/php`
@@ -785,17 +1000,51 @@ Names published before the revision existed are bare (`8.1.34-cli`); they stay i
 the registry as the snapshots they are, are read as revision 0 by the generator, and
 are not rewritten.
 
+**How the tag table is read out of the registry.** `tools/gen-supported.sh` asks
+the registry rather than the repository, because which tags exist is not a fact
+this repository holds. It takes an anonymous pull-scope token from
+`https://${GHCR_HOST}/token?scope=repository:${GHCR_REPO}:pull`, reads
+`/v2/<repo>/tags/list`, and GETs each manifest for its `Docker-Content-Digest`
+response header; `GHCR_HOST`/`GHCR_REPO` are overridable so a fork regenerates
+against its own namespace. A series appears only where the registry serves
+`<minor>-<variant>` for one of the manifest's `BUILD_VARIANTS`, and the exact name
+in that row is the highest `-r<N>` for the `SOURCE_REF` the manifest pins -- a bare
+`8.1.34-cli` reads as revision 0, and the older revisions in the registry are the
+snapshots they are -- they are deliberately not compared against. The floating tag
+and that newest exact name *must* resolve to the same digest: if they disagree, or
+if a served `<minor>-<variant>` has no exact name for the pinned version at all, the
+generator stops with an error instead of writing a row that cannot be true. It stops
+the same way when the registry answers with no tags at all, because an empty section
+would read as "nothing has been published" when the honest answer is "the registry
+did not answer", and it stops on any served name beginning `latest` -- README,
+DEPLOYING.md, SUPPORTED.md and this file tell a reader that no `latest` tag is
+published, and that is a claim about the namespace rather than only about the
+pipeline, so a name a manual push left behind has to fail generation instead of
+shipping a page the registry contradicts. Any other name outside the two published
+shapes is disclosed in the section rather than failing it: it answers a question no
+document asks, and leaving it out would make the section read as complete while
+omitting it. The `SUPPORTED.md up to date` gate in `validate` compares the
+committed file against exactly this read, which is why a registry outage blocks a
+release rather than a release shipping beside a status page that cannot say what it
+checked.
+
 There is no `latest` tag, by design. A release run publishes the series its input
-selects, so a
-`latest-<variant>` tag would resolve to whichever series was released last —
-neither the newest PHP nor a recommendation — and a bare
+selects — one series for a single-series dispatch, every supported series at once
+for `version=all` — so a `latest-<variant>` tag would resolve to whichever series
+was released last: release order, not code. Releasing 7.4 after an 8.1 release
+would move it back to 7.4, and an unrelated rebuild of an older series could move
+it backwards — neither the newest PHP nor a recommendation, and exactly the silent
+major-version jump a legacy application must not inherit from a base image. It
+could not even name the variant it meant, and a bare
 `docker pull <registry>/<namespace>/php` asks the registry for `latest`, the one
 name that cannot say which variant it is. `<minor>-<variant>` is the only floating
 name, and it cannot change major version. `tools/check-image-name.sh` asserts the
 removal: the publish step may write exactly the two names in the table, no document
 may advertise a latest tag on the published address, and README, this file and
 SUPPORTED.md must each state that there is none — so the absence reads as a
-decision, not an oversight.
+decision, not an oversight. Read that sentence before adding any moving name back:
+a third name is a change to the published namespace and to the docs that describe
+it, not a convenience.
 Every one of those names resolves to a **multi-arch manifest list** covering
 `linux/amd64` and `linux/arm64`; there are no architecture-suffixed tags.
 Builds are native (amd64 on `ubuntu-24.04`, arm64 on `ubuntu-24.04-arm`), each
@@ -955,9 +1204,10 @@ Manifests for the *unselected* series are still allowed
 to be unreviewed, and `build-version.yml` still refuses to build one it is handed.
 Every published image
 embeds `/opt/php/BUILD-PROVENANCE` and OCI labels (base digest, source
-repo/ref/commit, route, build package list, PECL pins, Composer version + phar
-digest, patch digests, and — via `/opt/php/BUILD-CLEANUP` — whether the source
-tree was shipped and what it weighed before and after trimming), with
+repo/ref/commit, OpenSSL route and version, PECL pins, Composer version + phar
+digest, the `patches/` tree's SHA-256 list, the build date, and the effective build
+package list via `/opt/php/BUILD-DEPS`; `/opt/php/BUILD-CLEANUP` records whether the
+source tree was shipped and what it weighed before and after trimming), with
 provenance/SBOM attestations attached where the registry supports them — and the
 dispatch checkbox is the whole decision, because there is no other way to start a
 release: `attestations` defaults to `true` and `release.yml` passes the value to
@@ -1044,9 +1294,14 @@ header file mode 600; argv is readable by anything on the runner, and a secret i
 
 **The 25000-byte limit is enforced here rather than by the Hub, because the Hub's
 answer to an oversized `full_description` is a silent truncation.** The script
-measures the payload and refuses to send, naming the number. README.md is ~22k today
-and the rewritten version is a little larger (16 relative links become absolute
-URLs); the day it exceeds the cap, the sync step goes red with the size in its
+measures the payload and refuses to send, naming the number. README.md is ~9k
+today and the rewritten version is a little larger (18 relative links become
+absolute blob URLs): 9854 bytes measured on 2026-11-05, against a cap of 25000.
+The consumer split is what bought that headroom back — the file that carried the
+build framework, the configuration surface and the per-version tables as well as
+the start-here text was 26943 bytes, i.e. already over the cap on its own, so a
+release could not have synced it. The day the payload exceeds the cap again, the
+sync step goes red with the size in its
 message and a maintainer decides what the Overview says instead of the Hub deciding
 by cutting mid-sentence.
 
@@ -1064,9 +1319,12 @@ request was accepted, so the script then does an anonymous
 `GET /v2/repositories/<user>/php/` and requires `full_description` to open with
 README.md's first line — marker `#` included, since the body is the file. Both
 pretty-printed and compact spacings are accepted, and the comparison stops at the
-first non-ASCII byte, because a JSON encoder is free to send the en dash in this
-repository's title as an escape and a byte-for-byte grep would then report a
-successful write as a failure.
+first non-ASCII byte, because a JSON encoder is free to send a non-ASCII byte as an
+escape (`\u2013` rather than the three bytes it is on disk) and a byte-for-byte grep
+would then report a successful write as a failure. The title is deliberately pure
+ASCII, so today the probe is the whole line; the cut still matters because README's
+first paragraph carries en dashes, and it is what keeps a title that later grows the
+scope parenthetical (`(PHP 5.6 – 8.1, CLI + FPM)`) from failing its own verification.
 
 **Where it runs.** The release path is `release.yml`'s `mirror-readme` job: one job,
 after the matrix, one call. It is deliberately not a step in `build-version.yml`,
@@ -1128,15 +1386,51 @@ placeholders, non-digest base images, and unpinned commits.
 - `tools/lint-dockerfile-shells.sh`: joins each Dockerfile `RUN` continuation the way the parser does and syntax-checks the result with `sh -n` and `bash -n`
 - `tools/list-version-branches.sh`: inventories every `# version-branch: <tag>` marker and, with `--check`, fails if the tags and the "Version-conditional behaviour" table here disagree in either direction
 - `tools/report-image-size.sh`: `./tools/report-image-size.sh <image-ref> [label]` — size, largest layers, in-image `du` breakdown and the cleanup record, appended to `$GITHUB_STEP_SUMMARY`; reports only, `BUDGET_MB` adds an advisory over/under line
-- `tools/gen-supported.sh`: regenerates `SUPPORTED.md` from manifests + review statuses (CI checks drift)
+- `tools/gen-supported.sh`: regenerates `SUPPORTED.md` from manifests + review statuses + the live registry (CI checks drift). Its "Upstream end of life" table is static data on purpose — php.net cannot publish another release for a branch it has stopped — so a new series gets a hand-recorded row from `https://www.php.net/eol.php` plus that series' changelog, while the "Pinned here" column is read from the manifest's `SOURCE_REF` at generation time and says so when the pin sits below php.net's final release
 - `tools/check-image-name.sh`: reads the registry/namespace defaults out of the release workflow and fails if the docs, the tag composition or the GHCR package name no longer describe the same published address (`ghcr.io/muffetlab/php`)
 - `tools/resolve-base-digest.sh`: `--check` reports each base tag's current digest and flags every manifest still on `@sha256:REPLACE_WITH_DIGEST`; `--base <tag>` resolves a tag no manifest names (a candidate base) and `--value` prints only that digest-pinned reference, which is what the CI trial job captures; prints, never writes
 - `tools/check-pin-drift.sh`: compares each `PHP_SRC_COMMIT` with the peeled commit of its upstream tag via `git ls-remote`; advisory only, never fails a build
 - `tools/scan-image.sh`: `./tools/scan-image.sh <image> [--findings FILE|-] [--json-out FILE] [--no-probe]` — OS gate: reads `/opt/php/RUNTIME-OS-PACKAGES` out of the image, probes what that image's own Debian suite offers today, classifies findings against `manifests/OS-CVE-STATUS.md`, and fails on a fix the kit could have taken and on a run that never scanned (see *The Debian base and its CVEs*). Exit 1 = action needed **or nothing was scanned** (`verdict: unverified`, `scanner: absent|trivy-failed` — an absence is not a clean), 2 = usage or a missing prerequisite. Needs Docker; `jq` only for a trivy JSON report; `--no-probe` for an offline run
 - `tools/install-trivy.sh`: installs the scanner at the pinned `TRIVY_VERSION`, verifying the release asset against a committed SHA-256 before running it, then proving the installed binary reports that version and is on the PATH later steps will use (`GITHUB_PATH` when it has to add it). The four digests are filled; an empty one is still announced rather than guessed at, but it no longer buys a quiet pass, because `scan-image.sh` verdicts an unscanned run `unverified` and exits 1. `--print-pin` prints the paste-ready lines and must run where GitHub is reachable
 - `docker-php-ext/`: vendored official extension scripts (pinned commit, SHA-256 verified in CI) + integration notes
-- `SUPPORTED.md`: generated support/pin/review matrix — start here as a consumer
+- `README.md`: the consumer entry point — its charter is the first row of the table below
+- `DEPLOYING.md`: the consumer guide — see the table below
+- `SUPPORTED.md`: generated status page — see the table below, and note that its prose belongs to `tools/gen-supported.sh`
 - `.github/workflows/`: CI validate gate + sequential build chain + release pipeline
 - `docker-compose.example.yml`: internal FPM + Nginx network example. The app is mounted at `./app:/var/www/html:ro` on **both** the nginx service and every FPM service, and that is not decoration: nginx sends `SCRIPT_FILENAME` as a path string and php-fpm opens it in its own container, so a different path on each side yields "Primary script unknown"
 - `nginx.conf.example`: matching Nginx site config — FastCGI to one compose service (`php81:9000`), `try_files $uri =404` for the PHP location, dotfiles denied; copy it per version you expose. `$document_root` is nginx's per-request `root`/`alias` value, not a host variable, so it works in containers as long as the two mounts agree
-- `LICENSE` / `DISCLAIMER.md` / `SECURITY.md`: licensing, responsibility boundary, and vulnerability reporting
+- `LICENSE` / `DISCLAIMER.md` / `SECURITY.md`: licensing, and the two documents whose charters are in the table below
+
+### Which document owns what
+
+The list above names the files; this names the boundaries. It is the single place a
+charter is written — every other document points here instead of restating one, and
+`tools/check-image-name.sh` asserts that this table exists, carries one row per
+document, keeps each row's role wording, and that README.md's "Documentation links"
+table still routes to all of it. That gate exists because every way ownership rots is
+silent: a mechanism paragraph lands in SECURITY.md because that is where an auditor
+already was, a hand-copied registry fact lands in DISCLAIMER.md because it read better
+inline, and a release-model sentence lands in SUPPORTED.md because a gate demanded the
+literal in that file. The third column is the one with teeth: content belonging to
+another document's charter moves there, and the gate that forced it into the wrong
+document moves with it.
+
+| Document | Owns | Does not own (and where that goes) |
+| --- | --- | --- |
+| `README.md` | project introduction, quick use, and the security warnings a puller needs before pulling | build, review or publish mechanics → `MAINTAINING.md`; per-version state → `SUPPORTED.md`; running and configuration detail → `DEPLOYING.md` |
+| `SUPPORTED.md` | what each version is actually built from and actually published — pins, base, review status, and the tags and digests the registry serves right now | why a pin or a base was chosen → `manifests/SECURITY-REVIEW.md`; how a release run works → `MAINTAINING.md`. Generated by `tools/gen-supported.sh`, so this prose has an owner: a charter change here is a generator change, and a hand edit is a drift-gate failure |
+| `SECURITY.md` | security policy, known vulnerabilities, and coverage | the CI steps that enforce a policy → `MAINTAINING.md` ("Hardening gates (what CI enforces)"); per-CVE evidence → `manifests/OS-CVE-STATUS.md` and `manifests/SECURITY-REVIEW.md` |
+| `DEPLOYING.md` | running, configuring, extending and deploying an image | how images are built, reviewed or published → `MAINTAINING.md`; which tags exist today → `SUPPORTED.md` |
+| `MAINTAINING.md` | build, review and publish processes, and the gates that enforce them | the policy claim a gate protects → `SECURITY.md` ("What the pipeline guarantees"); what a deployer should choose → `DEPLOYING.md` |
+| `DISCLAIMER.md` | the responsibility boundary: what this project is, what it is not, and what it leaves to you | any live state — tags, digests, review status, generation dates → `SUPPORTED.md`, which reads it out of the registry; a snapshot copied here rots without failing anything |
+| `manifests/SECURITY-REVIEW.md` | the PHP-side evidence register: pin-by-pin review records, CVE dispositions, and the decisions behind them | policy → `SECURITY.md`; the summary a consumer reads → `SUPPORTED.md` |
+| `manifests/OS-CVE-STATUS.md` | the Debian-side evidence register: one row per OS CVE with disposition, evidence and review date | the scanner that gates against it and how its verdicts work → `MAINTAINING.md`; the policy the register serves → `SECURITY.md` |
+
+Two of these documents are generated or gated in ways that make the boundary a
+mechanical property rather than a preference: `SUPPORTED.md` cannot carry a sentence
+its generator does not emit, and `tools/check-image-name.sh` requires certain
+statements to be present in certain files. When such a gate demands content that the
+table above puts in another document, the gate is the bug — move the requirement to
+the document that owns the content, as the Composer-pin gate was moved from README.md
+to DEPLOYING.md's per-series table, and do not keep the sentence in the wrong file to
+keep a job green.

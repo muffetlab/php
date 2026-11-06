@@ -268,7 +268,11 @@ jobs:
           [ -n "$legacy_pin" ] || err "Dockerfile: legacy Composer pin not found"
           [ -n "$modern_pin" ] || err "Dockerfile: modern Composer pin not found"
           echo "Dockerfile pins: legacy=$legacy_pin modern=$modern_pin"
-          for f in build.sh .github/workflows/build-version.yml tools/gen-supported.sh README.md MAINTAINING.md SUPPORTED.md; do
+          # The doc half of the list is the file that actually states the numbers:
+          # DEPLOYING.md's "What each series is built against" table, not README.md,
+          # which names the categories and points there. Adding a doc to this list
+          # means requiring it to carry both pins.
+          for f in build.sh .github/workflows/build-version.yml tools/gen-supported.sh DEPLOYING.md MAINTAINING.md SUPPORTED.md; do
             grep -Fq "$legacy_pin" "$f" || err "$f: missing Composer pin $legacy_pin"
             grep -Fq "$modern_pin" "$f" || err "$f: missing Composer pin $modern_pin"
           done

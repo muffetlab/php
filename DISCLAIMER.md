@@ -13,27 +13,21 @@ releasing them — with a documented patch/CVE review trail
 
 The images are what this project is for. The build framework, the pins and the
 review records are here so that any image claiming to be one of these can be
-checked against them: every published image embeds
-`/opt/php/BUILD-PROVENANCE` and ships `/usr/local/bin/verify-runtime` to
-re-audit those claims in place.
+checked against them: [DEPLOYING.md](DEPLOYING.md) ("Checking what an image
+actually contains") names what an image carries and how to re-audit those claims
+in place.
 
-What is published is decided by [SUPPORTED.md](SUPPORTED.md), not by this
-file. Every manifest is pinned and approved, so none is skipped for being
-unready, and as of 2026-11-01 every series has been built and tested in CI on
-both architectures, which is what its `tested-in-CI` review status claims. That
-status claims neither more nor less than that: it is not an approval
-(`approved-*` needs a named reviewer), it does not mean the CVE fixes were
-exercised by a test, and it does not mean there is an image to pull. Which tags
-exist is a live registry fact, so this file does not enumerate them by hand:
-[SUPPORTED.md](SUPPORTED.md)'s generated "Release tags" section is the authority,
-read out of `ghcr.io/muffetlab/php`'s tag list at generation time — at the last
-generation (2026-11-04) it recorded `<minor>-<variant>` and its
-`<full-php-version>-<variant>` for seven series, and no tags at all for 5.6,
-whose release run has not written any name yet. Those exact names were written
-before the image revision existed; a release from here writes the immutable
-`<full-php-version>-r<revision>-<variant>` beside them and never rewrites one.
-There is no `latest` tag in the
-registry or in the pipeline for any series to acquire later.
+What is published is decided by [SUPPORTED.md](SUPPORTED.md), not by this file.
+That page reads the registry at generation time, so which tags exist and what
+each digest resolves to is its answer, and no date copied into this file can
+keep such an answer current — a snapshot here would rot without failing anything.
+Its `tested-in-CI` status claims neither more nor less than that the image passes
+the project's CI build and runtime checks: it is not an approval (an
+`approved-*` row needs a named reviewer, recorded in
+[manifests/SECURITY-REVIEW.md](manifests/SECURITY-REVIEW.md)), it does not mean
+the CVE fixes were exercised by a test, and it does not mean there is an image to
+pull. Nor will a `latest` name appear later: the pipeline publishes none, for any
+variant, and [MAINTAINING.md](MAINTAINING.md) ("Publishing images") records why.
 
 [backports]: https://github.com/shivammathur/php-src-backports
 

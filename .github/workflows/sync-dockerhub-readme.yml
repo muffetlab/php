@@ -29,7 +29,8 @@ name: sync-dockerhub-readme
 #
 # Docker Hub caps full_description at 25000 bytes and truncates silently, so the
 # script measures the payload and refuses to send rather than publish half a README.
-# README.md is around 22k today; the day it grows past the cap this workflow turns
+# README.md is ~9k today (a rewritten payload of 9854 bytes against the 25000 cap);
+# the day it grows past the cap this workflow turns
 # red with the number in the message, which is the honest outcome -- a maintainer
 # then decides what the Overview says, not the Hub.
 #

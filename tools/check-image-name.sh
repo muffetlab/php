@@ -4,7 +4,7 @@
 #
 # The published ref is <registry>/<namespace>/php, composed in
 # .github/workflows/build-version.yml from its registry/namespace inputs, and
-# the resulting address (ghcr.io/muffetlab/php) is what README.md,
+# the resulting address (ghcr.io/muffetlab/php) is what README.md, DEPLOYING.md,
 # MAINTAINING.md, SUPPORTED.md, docker-compose.example.yml and
 # docker-php-ext/README.md advertise. A rename that only touches one side
 # produces docs pointing at a tag that was never pushed, so this gate reads the
@@ -24,6 +24,11 @@
 # version-shaped things (git tag, dispatch input, manifest, Docker tag) is
 # responsible for, and which workflow is allowed to act on it.
 #
+# And the documents' own charters, because "which file owns this content" is the
+# same kind of agreement as "which file owns this address": MAINTAINING.md states one
+# charter per document, README.md routes readers by it, and both are checked so a
+# boundary cannot drift one paragraph at a time.
+#
 # Usage: ./tools/check-image-name.sh   (exit 0 = consistent, 1 = drift)
 set -eu
 
@@ -32,7 +37,7 @@ cd "$root"
 
 build_wf=".github/workflows/build-version.yml"
 release_wf=".github/workflows/release.yml"
-docs="README.md MAINTAINING.md SUPPORTED.md docker-compose.example.yml docker-php-ext/README.md"
+docs="README.md DEPLOYING.md MAINTAINING.md SUPPORTED.md docker-compose.example.yml docker-php-ext/README.md"
 
 fail=0
 err() {
@@ -281,24 +286,99 @@ if grep -Fq "./${sync_tool}" "$build_wf"; then
 fi
 # What the documents have to say about the model, matched against a whitespace-
 # flattened copy of each file so a claim is not "missing" merely because the prose
-# wrapped across a line break. Four things each doc must still state:
-#   vX.Y.Z                    -- the shape of a source release tag
-#   source release tag        -- what a git tag is for (it selects nothing)
-#   8.1.34-r1                 -- an immutable image name, by example
+# wrapped across a line break. The four claims split by audience, because a person
+# pulling an image and a person cutting a release need different halves:
+#   8.1.34-r1                  -- an immutable image name, by example
 #   Exact tags are never moved -- why pinning one is safe
-# A doc that drops the second invites a maintainer to cut another tag for the second
-# build of that PHP version, which is the model this project retired: the tag marks
-# source, the input picks the scope, the manifest holds the version, and the image
-# name carries the revision. Dropping the last one invites a reader to pin an exact
-# name and wait for a fix that will never arrive under it.
+#       Everyone reads these: they are the reason a deployer may pin a name.
+#   vX.Y.Z                     -- the shape of a source release tag
+#   source release tag         -- what a git tag is for (it selects nothing)
+#       Release mechanics, so MAINTAINING.md alone carries them. This was widened to
+#       DEPLOYING.md, SUPPORTED.md and SECURITY.md before the charters were written
+#       down, and the widening is what put a git-tag paragraph in the running guide
+#       and a release model in the status page: a document the gate pins is a
+#       document that keeps the content, however little its readers need it.
+#       The same two literals are now refused in the consumer documents instead of
+#       required there, so the paragraph cannot arrive back through a good edit.
+# A maintainer-facing doc that drops the second invites cutting another tag for the
+# second build of that PHP version, which is the model this project retired: the tag
+# marks source, the input picks the scope, the manifest holds the version, and the
+# image name carries the revision. Dropping the first pair invites a reader to pin an
+# exact name and wait for a fix that will never arrive under it.
 flat() { tr '\n' ' ' < "$1" | tr -s ' '; }
-for f in README.md MAINTAINING.md SUPPORTED.md SECURITY.md; do
-  [ -f "$f" ] || { err "$f: missing"; continue; }
-  for want in 'vX.Y.Z' 'source release tag' '8.1.34-r1' 'Exact tags are never moved'; do
-    if ! flat "$f" | grep -Fq -- "$want"; then
-      err "$f: no longer states \`${want}\` -- see the release model in MAINTAINING.md ('Publishing images'): a git tag marks source (vX.Y.Z), the dispatch input picks the series or all, manifests/<series>.env holds the PHP version, and the image name carries the revision (-r<N>, and exact tags are never moved)"
+require_flat() {
+  file="$1"; reason="$2"; shift 2
+  [ -f "$file" ] || { err "$file: missing"; return; }
+  body="$(flat "$file")"
+  for want in "$@"; do
+    if ! printf '%s' "$body" | grep -Fq -- "$want"; then
+      err "$file: no longer states \`${want}\` -- ${reason}"
     fi
   done
+}
+forbid_flat() { # <file> <charter reason> <literal>...
+  file="$1"; reason="$2"; shift 2
+  [ -f "$file" ] || { err "$file: missing"; return; }
+  body="$(flat "$file")"
+  for unwanted in "$@"; do
+    if printf '%s' "$body" | grep -Fq -- "$unwanted"; then
+      err "$file: carries \`${unwanted}\`, which is not its content -- ${reason}"
+    fi
+  done
+}
+model_reason="see the release model in MAINTAINING.md ('Publishing images'): a git tag marks source (vX.Y.Z), the dispatch input picks the series or all, manifests/<series>.env holds the PHP version, and the image name carries the revision (-r<N>, and exact tags are never moved)"
+for f in README.md DEPLOYING.md MAINTAINING.md SUPPORTED.md SECURITY.md; do
+  require_flat "$f" "$model_reason" '8.1.34-r1' 'Exact tags are never moved'
+done
+# Only the maintainer document states them, which is why they are not in the loop
+# above: README/DEPLOYING need the image names, not the source tag.
+require_flat MAINTAINING.md "$model_reason" 'vX.Y.Z' 'source release tag'
+# The inverse half, widened as each out-of-charter paragraph is moved out (see
+# MAINTAINING.md 'Which document owns what'). SECURITY.md lost its copy when its CI
+# gate inventory moved to MAINTAINING.md ("Hardening gates (what CI enforces)") and
+# its reporting flow stopped describing the tag scheme. SUPPORTED.md lost its copy
+# when tools/gen-supported.sh stopped emitting a release-model paragraph and a
+# generator-mechanics section, which is what moved the four-inputs model, the
+# namespace composition and the read-out-of-the-registry details to MAINTAINING.md
+# ("Publishing images"). DISCLAIMER.md is refused on the same terms: its charter is the
+# responsibility boundary, and the tag scheme is not a boundary claim. All five documents
+# are refused now, so nothing is left to relocate: a future edit that puts such a
+# paragraph back has to delete something first.
+charter_reason="MAINTAINING.md ('Which document owns what') assigns release mechanics to MAINTAINING.md; route the reader there instead of restating it"
+# The two names of the release inputs themselves, refused alongside the model: a
+# document that tells a reader what to click has become the release runbook, which is
+# the same drift as a document that explains why the runbook is shaped that way.
+input_reason="MAINTAINING.md ('Publishing images') is the runbook that names the release inputs; a consumer or policy document that names them is describing a dispatch instead of routing to the one that does"
+for f in README.md DEPLOYING.md SUPPORTED.md SECURITY.md DISCLAIMER.md; do
+  forbid_flat "$f" "$charter_reason" 'vX.Y.Z' 'source release tag'
+  forbid_flat "$f" "$input_reason" 'workflow_dispatch' 'version=all'
+done
+
+# And the specific way DISCLAIMER.md rots, which its charter calls out by name: it is the
+# one document whose own reason for existing ("what is published is decided by
+# SUPPORTED.md, not by this file") a copied sentence contradicts, because a dated
+# statement of this project's state -- which tags existed, when CI last went green, what
+# the registry answered at the last generation -- is exactly the snapshot that goes false
+# quietly. Upstream dates are not state and belong here when the argument needs them;
+# this rule is about the ISO form this repository uses for its own records, and today
+# the file needs no date at all.
+snap="$(grep -nE '20[0-9]{2}-[0-9]{2}-[0-9]{2}' DISCLAIMER.md 2>/dev/null | tr '\n' ' ' || true)"
+if [ -n "$snap" ]; then
+  err "DISCLAIMER.md carries a dated snapshot of this project's own state (${snap}); SUPPORTED.md reads that out of the registry and manifests/SECURITY-REVIEW.md records the dated evidence -- a copied date here is a claim no gate can re-check"
+fi
+
+# The status page is the only place that says what an image is built ON, and both
+# halves of that answer are columns: a row reading "pinned by digest" without a base
+# names an OS nobody can check, and a base name without its pin says nothing about
+# whether the bytes are reproducible. A column that disappears here disappears from
+# the generated file, from the generator, and from the reader's argument for trusting
+# a digest, all at once and with nothing failing -- so the header is pinned in the
+# committed file AND in the script that writes it.
+for f in SUPPORTED.md tools/gen-supported.sh; do
+  [ -f "$f" ] || { err "$f: missing"; continue; }
+  if ! flat "$f" | grep -Fq -- 'Debian base | Base pin'; then
+    err "$f: no longer carries the \`Debian base\` / \`Base pin\` columns -- the base image and its pin are what SUPPORTED.md answers for a series, and tools/gen-supported.sh is the only thing that writes them"
+  fi
 done
 
 # Nothing in the repository may address an image as "php-legacy:" -- that was
@@ -326,18 +406,13 @@ if [ -n "$stale_rev" ]; then
   err "these files still use the retired <full>-<N>-<variant> image name (a revision is spelled -r<N>): ${stale_rev}"
 fi
 
-# The latest tag is gone: a release run publishes the series it selects -- one
-# series for a single-series dispatch, all of them for version=all -- so
-# a "latest-<variant>" name resolved to whichever series was released last --
-# neither the newest PHP nor a recommendation, and an unrelated rebuild of an
-# older series moved it backwards. A full release would move every latest name at
-# once, which is the same silent-major-jump argument a single-series release cannot
-# escape.
-# <minor>-<variant> is the only floating name
-# the pipeline writes, and it cannot change major version. Assert both halves of
-# that: the publish step writes exactly the two tags, and no document advertises
-# a latest address. A pull of an advertised-but-unpublished name is the failure
-# this whole script exists to prevent.
+# The latest tag is gone, and the argument for it is MAINTAINING.md's prose ("Publishing
+# images"), not this comment: a "latest-<variant>" would resolve to whichever series was
+# released last, which records release order rather than code. What this script asserts is
+# the mechanical half of that: the publish step writes exactly the two names, no document
+# advertises a latest address, and the documents a reader chooses a tag from state that
+# there is none. A pull of an advertised-but-unpublished name is the failure this whole
+# script exists to prevent.
 # shellcheck disable=SC2016
 if grep -Fq -- '-t ${repo}:latest' "$build_wf"; then
   err "${build_wf}: the publish step writes a latest tag again; there is no latest tag (see MAINTAINING.md 'Publishing images')"
@@ -352,11 +427,16 @@ if [ -n "$stale_latest" ]; then
   err "these files advertise a latest tag on the published address, which the pipeline does not publish: ${stale_latest}"
 fi
 # And the removal has to be stated, not just absent -- a silent omission reads as
-# an oversight to anyone who expected the php:latest convention.
-for f in README.md MAINTAINING.md SUPPORTED.md; do
+# an oversight to anyone who expected the php:latest convention. The claim is the
+# consumer-facing half (a pull of "php:latest" answers "manifest unknown", so a reader
+# choosing a tag has to be told there is nothing to choose), and the four documents that
+# name a tag to pull state it: README and DEPLOYING for the person deploying, SUPPORTED
+# because the namespace it lists is the registry's, and MAINTAINING because it owns the
+# reason there is none, which the three above route here rather than restate.
+for f in README.md DEPLOYING.md MAINTAINING.md SUPPORTED.md; do
   # shellcheck disable=SC2016
   if ! grep -Fq 'no `latest` tag' "$f"; then
-    err "$f: no longer states that no latest tag is published (and why)"
+    err "$f: no longer states that no latest tag is published -- the claim belongs here, the argument for it belongs in MAINTAINING.md ('Publishing images')"
   fi
 done
 
@@ -412,6 +492,90 @@ for f in MAINTAINING.md SECURITY.md; do
   fi
 done
 
+# Document charters. One table in MAINTAINING.md ("Which document owns what") is the
+# single place a document's charter is written; every other document points at it
+# instead of restating one. Asserted here because each way ownership rots is silent:
+# a mechanism paragraph lands in SECURITY.md because that is where an auditor already
+# was, a hand-copied registry fact lands in DISCLAIMER.md because it read better
+# inline, and a release-model sentence lands in SUPPORTED.md because a gate demanded
+# the literal in that file. Checking the rows keeps a charter from quietly widening --
+# a document can be reworded, not redefined, without this gate saying so.
+charter="$(awk '/^### Which document owns what/{f=1;next} f&&/^#{1,3} /{f=0} f' MAINTAINING.md)"
+if [ -z "$charter" ]; then
+  err "MAINTAINING.md: no 'Which document owns what' charter section -- that table is where a document's ownership is defined, and README.md's link table routes readers by it"
+fi
+charter_row() { # <document> <role literal>...
+  doc="$1"; shift
+  row="$(printf '%s\n' "$charter" | grep -F -- "| \`$doc\` |" | head -1 || true)"
+  if [ -z "$row" ]; then
+    err "MAINTAINING.md: the charter table has no row for \`$doc\` -- each document gets exactly one, and a document without one has no defined scope"
+    return
+  fi
+  for want in "$@"; do
+    if ! printf '%s' "$row" | grep -Fq -- "$want"; then
+      err "MAINTAINING.md: the \`$doc\` charter no longer states \`${want}\` -- reword a charter deliberately, not by dropping a term from it"
+    fi
+  done
+}
+charter_row 'README.md' 'project introduction' 'quick use' 'security warnings'
+charter_row 'SUPPORTED.md' 'actually built from' 'actually published' 'gen-supported.sh'
+charter_row 'SECURITY.md' 'security policy' 'known vulnerabilities' 'coverage'
+charter_row 'DEPLOYING.md' 'running, configuring, extending and deploying'
+charter_row 'MAINTAINING.md' 'build, review and publish processes' 'gates that enforce'
+charter_row 'DISCLAIMER.md' 'responsibility boundary'
+charter_row 'manifests/SECURITY-REVIEW.md' 'PHP-side evidence register'
+charter_row 'manifests/OS-CVE-STATUS.md' 'Debian-side evidence register'
+
+# SECURITY.md's guarantee table and MAINTAINING.md's gate index are one agreement
+# written across two documents: the table is what an auditor may rely on, the index
+# is how CI earns the claim. Both halves rot silently -- a gate added with no
+# guarantee beside it, a guarantee reworded until it names a gate that does not
+# exist -- and no build fails on its own account, so the two name lists are
+# compared in both directions here, the way tools/list-version-branches.sh compares
+# markers against the version-branch inventory. The join is the exact name: a bullet
+# `- **Name** ...` in MAINTAINING.md, a row `| Name | ... |` in SECURITY.md.
+gates_section="$(awk '/^## Hardening gates \(what CI enforces\)/{f=1;next} f&&/^## /{f=0} f' MAINTAINING.md)"
+if [ -z "$gates_section" ]; then
+  err "MAINTAINING.md: no 'Hardening gates (what CI enforces)' section -- that index is where the mechanism behind each SECURITY.md guarantee is written, and without it the table below promises what nothing enforces"
+fi
+guarantee_section="$(awk '/^## What the pipeline guarantees/{f=1;next} f&&/^## /{f=0} f' SECURITY.md)"
+if [ -z "$guarantee_section" ]; then
+  err "SECURITY.md: no 'What the pipeline guarantees' section -- the policy claims belong there, one row per gate in MAINTAINING.md, and the mechanism belongs in MAINTAINING.md rather than in the security policy"
+fi
+if ! printf '%s' "$guarantee_section" | grep -Fq 'Hardening gates (what CI enforces)'; then
+  err "SECURITY.md: the guarantee section no longer names MAINTAINING.md's 'Hardening gates (what CI enforces)' -- a reader has to be routed to the mechanism, not left with the claim alone"
+fi
+gates="$(printf '%s\n' "$gates_section" | sed -n 's/^- \*\*\([^*]*\)\*\*.*$/\1/p' | LC_ALL=C sort)"
+guarantees="$(printf '%s\n' "$guarantee_section" | awk -F'|' '/^\|/ { c=$2; gsub(/^[ \t]+|[ \t]+$/, "", c); if (c == "" || c == "---" || c == "Guarantee") next; print c }' | LC_ALL=C sort)"
+join_names() { sed -e '1!s/^/; /' | tr -d '\n'; }
+unclaimed="$(comm -23 <(printf '%s\n' "$guarantees") <(printf '%s\n' "$gates") | sed '/^$/d' || true)"
+if [ -n "$unclaimed" ]; then
+  err "SECURITY.md guarantees with no gate bullet of that name in MAINTAINING.md ('Hardening gates (what CI enforces)'): $(printf '%s\n' "$unclaimed" | join_names)"
+fi
+unwritten="$(comm -13 <(printf '%s\n' "$guarantees") <(printf '%s\n' "$gates") | sed '/^$/d' || true)"
+if [ -n "$unwritten" ]; then
+  err "MAINTAINING.md gates with no guarantee row of that name in SECURITY.md ('What the pipeline guarantees'): $(printf '%s\n' "$unwritten" | join_names)"
+fi
+gate_n="$(printf '%s\n' "$gates" | sed '/^$/d' | wc -l | tr -d ' ')"
+guar_n="$(printf '%s\n' "$guarantees" | sed '/^$/d' | wc -l | tr -d ' ')"
+pairing_note=''
+if [ -z "$unclaimed" ] && [ -z "$unwritten" ] && [ "$gate_n" -gt 0 ] && [ "$gate_n" = "$guar_n" ]; then
+  pairing_note="Guarantee/gate pairing: ${guar_n} SECURITY.md claims, each with a MAINTAINING.md gate of the same name"
+fi
+
+# The routing table a reader actually uses has to cover the same set, or a charter
+# becomes a list nobody can reach: adding a document to the table without a route
+# leaves consumers to guess which file holds the answer.
+routes="$(awk '/^## Documentation links/{f=1;next} f&&/^## /{f=0} f' README.md)"
+if [ -z "$routes" ]; then
+  err "README.md: no 'Documentation links' section -- the charters have to be reachable from the entry point"
+fi
+for d in DEPLOYING.md SUPPORTED.md SECURITY.md DISCLAIMER.md MAINTAINING.md manifests/SECURITY-REVIEW.md manifests/OS-CVE-STATUS.md; do
+  if ! printf '%s' "$routes" | grep -Fq -- "$d"; then
+    err "README.md: the Documentation links table no longer routes to $d, which MAINTAINING.md's charter table names as a document a reader needs"
+  fi
+done
+
 if [ "$fail" = 0 ]; then
   printf 'Published image address: %s\n' "$published"
   printf 'Local build tag:         %s:<version>-<variant>-test (never pushed)\n' "$local_repo"
@@ -420,6 +584,8 @@ if [ "$fail" = 0 ]; then
   printf 'Published tags:          %s:<full>-r<revision>-<variant> (immutable) and %s:<minor>-<variant> (floating); no latest tag\n' "$published" "$published"
   printf 'Trigger ownership:       %s is dispatch-only and the only release entry point; %s has no push trigger; %s is dispatch-only\n' "$release_wf" "$ci_wf" "$sync_wf"
   printf 'Hub Overview sync:       %s, called once per release by %s (mirror-readme) and by %s for a README-only change; self-tested in both validate jobs\n' "$sync_tool" "$release_wf" "$sync_wf"
+  printf 'Document charters:       MAINTAINING.md ("Which document owns what") states one per document, README.md routes to all of them\n'
+  [ -z "$pairing_note" ] || printf '%s\n' "$pairing_note"
   printf 'Checked: %s, %s, build.sh, %s\n' "$build_wf" "$release_wf" "$(printf '%s' "$docs SECURITY.md" | tr '\n' ' ')"
 fi
 exit "$fail"

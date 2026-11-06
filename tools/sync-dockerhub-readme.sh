@@ -217,7 +217,10 @@ if [ "$self_test" = 1 ]; then
   # The read-back probe, pinned on this repository's real first line and on the two
   # rules that keep it from crying wolf: keep the "# " marker (the body is the file),
   # and stop at the first non-ASCII byte so an escaped en dash cannot fail a write
-  # that succeeded.
+  # that succeeded. The real title is pure ASCII, so the non-ASCII rule needs its own
+  # input: the second fixture is the scope-carrying title form ("... (PHP 5.6 – 8.1,
+  # CLI + FPM)") that the probe had to survive, kept here even though README.md no
+  # longer uses it, because that is the case the rule exists for.
   probe_is() { # <label> <file> <expected>
     local got
     got="$(readback_probe "$2")"
@@ -227,10 +230,12 @@ if [ "$self_test" = 1 ]; then
       err "$1: probe was '$got', expected '$3'"
     fi
   }
-  printf '# Legacy PHP security images (PHP 5.6 – 8.1, CLI + FPM)\n\nbody\n' > "$tmp/real.md"
+  printf '# Legacy PHP Security Images\n\nbody\n' > "$tmp/real.md"
   printf 'Short ASCII title\nbody\n' > "$tmp/short.md"
+  printf '# Legacy PHP Security Images (PHP 5.6 – 8.1, CLI + FPM)\n\nbody\n' > "$tmp/dash.md"
   printf '\nbody, no title at all\n' > "$tmp/blank.md"
-  probe_is "first line keeps its # marker and stops at the en dash" "$tmp/real.md" '# Legacy PHP security images (PHP 5.6 '
+  probe_is "the real title is used whole, marker and all"           "$tmp/real.md" '# Legacy PHP Security Images'
+  probe_is "a scope-carrying title stops at the en dash"            "$tmp/dash.md" '# Legacy PHP Security Images (PHP 5.6 '
   probe_is "an already-ASCII line is used whole even when short"    "$tmp/short.md" 'Short ASCII title'
   if readback_probe "$tmp/blank.md" >/dev/null 2>&1; then
     err "a README with an empty first line should be refused, and was not"

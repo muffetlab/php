@@ -132,6 +132,37 @@ current_exact_tag() {
   printf '%s' "$best"
 }
 
+pinned_php() {
+  # $1 = series. What this repository's manifest pins as the PHP version --
+  # SOURCE_REF, the release tag the manifest also records the peeled commit of.
+  # Plain sed, because sourcing the whole manifest to obtain one field would run
+  # project configuration for a string.
+  sed -n 's/^SOURCE_REF=//p' "${ROOT}/manifests/${1}.env" 2>/dev/null | head -1 | tr -d '"'
+}
+
+upstream_last() {
+  # $1 = series -> "<last official release> <released> <announced end of life>".
+  # php.net's own record, read from its unsupported-versions table and each
+  # series' changelog and news archive on 2026-11-05. These are closed facts -- a
+  # branch php.net has stopped cannot gain another release -- so they are carried
+  # as data rather than scraped on every run, and a status page that could rewrite
+  # its own history is not a status page. The columns are deliberately not assumed
+  # to be in order: php.net announced 5.6's end of life on 2018-12-31 and shipped
+  # 5.6.40 on 2019-01-10, and shipped 7.0.33 on 2018-12-06 before announcing 7.0's
+  # end of life on 2019-01-10.
+  case "$1" in
+    5.6) printf '5.6.40 2019-01-10 2018-12-31' ;;
+    7.0) printf '7.0.33 2018-12-06 2019-01-10' ;;
+    7.1) printf '7.1.33 2019-10-24 2019-12-01' ;;
+    7.2) printf '7.2.34 2020-10-01 2020-11-30' ;;
+    7.3) printf '7.3.33 2021-11-18 2021-12-06' ;;
+    7.4) printf '7.4.33 2022-11-03 2022-11-28' ;;
+    8.0) printf '8.0.30 2023-08-03 2023-11-26' ;;
+    8.1) printf '8.1.34 2025-12-18 2025-12-31' ;;
+    *)   printf '? - -' ;;
+  esac
+}
+
 {
   echo "# Supported versions"
   echo
@@ -141,14 +172,19 @@ current_exact_tag() {
   echo "Read [DISCLAIMER.md](DISCLAIMER.md) and [SECURITY.md](SECURITY.md) before using"
   echo "any image from this project. A row below being filled in does **not** mean the"
   echo "version is secure; it means the pins and review statuses recorded in this"
-  echo "repository at generation time."
+  echo "repository at generation time. This page is state and nothing else: why a pin"
+  echo "or a base was chosen is in \`manifests/SECURITY-REVIEW.md\` and"
+  echo "[manifests/OS-CVE-STATUS.md](manifests/OS-CVE-STATUS.md), and how a build or a"
+  echo "release run works is in [MAINTAINING.md](MAINTAINING.md)."
   echo
-  echo "| Version | OpenSSL route | Source repo | Variants | Composer | Base image | Patches | Security review | Extensions |"
-  echo "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+  echo "| Version | OpenSSL route | Debian base | Base pin | Source repo | Variants | Composer | Patches | Security review | Extensions |"
+  echo "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
   for v in $SUPPORTED_VERSIONS; do
     f="${ROOT}/manifests/${v}.env"
     if [ ! -f "$f" ]; then
-      echo "| ${v} | — | — | — | — | manifest missing | — | unreviewed |"
+      # Ten columns, same order as the header: a series with no manifest is a row
+      # that says so rather than a row that is short.
+      echo "| ${v} | — | — | — | manifest missing | — | — | — | unreviewed | — |"
       continue
     fi
     # Trusted project configuration, not untrusted input.
@@ -193,6 +229,14 @@ current_exact_tag() {
           ;;
         *) base="UNPINNED — invalid" ;;
       esac
+      # Which Debian a series is built on is a separate fact from whether that
+      # choice is pinned, and a status table that printed only the second left the
+      # reader to compare base images in another document. The ref is printed
+      # without its digest: the digest is in the manifest and in the image, and a
+      # 64-hex column here would make every row unreadable.
+      base_ref="${BASE_IMAGE:-}"
+      base_ref="${base_ref%%@sha256:*}"
+      [ -n "$base_ref" ] || base_ref="—"
       if [ "${PATCHSET_APPROVED:-0}" = "1" ]; then
         patches="approved"
       else
@@ -225,48 +269,83 @@ current_exact_tag() {
       if [ -n "$ext_added" ]; then
         ext_cell="${ext_cell} (+${ext_added})"
       fi
-      echo "| ${v} | ${route} | ${repo} | ${variants} | ${composer} | ${base} | ${patches} | $(status_for "$v") | ${ext_cell} |"
+      echo "| ${v} | ${route} | ${base_ref} | ${base} | ${repo} | ${variants} | ${composer} | ${patches} | $(status_for "$v") | ${ext_cell} |"
     )
   done
   echo
+  echo "How to read a row. \`Debian base\` is the OS the image is built on and \`Base"
+  echo "pin\` says whether that ref is pinned by digest -- a placeholder or an unpinned"
+  echo "ref is stated as it is, never rounded up to \"pinned\". \`Source repo\` is the"
+  echo "source of record the manifest points at, \`Variants\` what a release publishes"
+  echo "for the series, and \`Composer\` the release the image installs. \`Patches\` is"
+  echo "the human patchset decision (\`PATCHSET_APPROVED=1\` reads \`approved\`); a row"
+  echo "reading \`pending review\` is never built or published. \`Security review\` is"
+  echo "the status recorded in \`manifests/SECURITY-REVIEW.md\`: \`tested-in-CI\` means"
+  echo "the image passes the project's CI build and runtime checks, which is not an"
+  echo "approval and not a claim that a tag exists. Whether a tag exists is answered"
+  echo "only by \"What the registry serves right now\" below."
+  echo
+  echo "## Upstream end of life"
+  echo
+  echo "Every series above is end-of-life upstream: \`php/php-src\` stopped releasing for"
+  echo "these lines, which is why the source of record is a backports fork and not PHP"
+  echo "itself. The dates are php.net's own record (its unsupported-versions table plus"
+  echo "each series' changelog and news archive, read 2026-11-05) and they are closed"
+  echo "facts, so they are stored here rather than fetched at generation time."
+  echo
+  echo "| Series | Last official release | Released | Announced end of life | Pinned here |"
+  echo "| --- | --- | --- | --- | --- |"
+  for v in $SUPPORTED_VERSIONS; do
+    read -r u_last u_rel u_eol <<<"$(upstream_last "$v")"
+    u_pin="$(pinned_php "$v")"
+    if [ -z "$u_pin" ]; then
+      u_cell="no manifest"
+    elif [ "$u_pin" = "$u_last" ]; then
+      u_cell="\`${u_pin}\`"
+    else
+      # Saying so is the point: a series pinned below php.net's final release is
+      # one more version behind than the row above implies.
+      u_cell="\`${u_pin}\` -- below the last official release"
+    fi
+    echo "| ${v} | \`${u_last}\` | ${u_rel} | ${u_eol} | ${u_cell} |"
+  done
+  echo
+  echo "The release and EOL columns are not in order on every row, and that is what"
+  echo "php.net published: 5.6's end of life was announced on 2018-12-31 and \`5.6.40\`"
+  echo "arrived on 2019-01-10, while \`7.0.33\` came on 2018-12-06, before 7.0's announced"
+  echo "end of life on 2019-01-10, with nothing after it. \"Pinned here\" is this"
+  echo "repository's own \`PHP_VERSION\`, read from the manifest at generation time --"
+  echo "every series sits on php.net's final release today, and a row that stops saying"
+  echo "so means the pin is behind it."
+  echo
   echo "## Composer"
   echo
-  echo "The Composer column shows the pinned release each image installs. Composer"
+  echo "The Composer column is the release each image installs. Composer"
   echo "2.x requires PHP >= 7.2.5, so PHP 5.6/7.0/7.1 stay on the final 1.x release"
-  echo "(1.10.28). The installer script is fetched from an immutable git commit and"
-  echo "digest-verified, and the installed phar is digest-verified too; both digests"
-  echo "are recorded in \`/opt/php/BUILD-PROVENANCE\`. See MAINTAINING.md"
-  echo "(\"Composer trust model\") for the full trust model and how to override the pin."
+  echo "(1.10.28) and 7.2–8.1 ship 2.11.0. A manifest that overrides the policy pin"
+  echo "without also pinning a digest is labelled as unverified in its row. Where"
+  echo "those two numbers come from and how the built image verifies them is"
+  echo "MAINTAINING.md (\"Composer trust model\"); the digests themselves are recorded"
+  echo "in \`/opt/php/BUILD-PROVENANCE\` inside the image."
   echo
   echo "## Release tags"
   echo
-  echo "Published images are \`ghcr.io/muffetlab/php\` (the release workflow's"
-  echo "registry/namespace inputs compose \`<registry>/<namespace>/php\`; a fork passes"
-  echo "its own namespace) and carry:"
+  echo "Published images are \`ghcr.io/muffetlab/php\`, and a release writes two names"
+  echo "per series and variant -- no third name, and no other registry:"
   echo
-  echo "- \`ghcr.io/muffetlab/php:<minor>-<variant>\` — recommended deploy tag; moves only within its own series"
-  echo "- \`ghcr.io/muffetlab/php:<full-php-version>-r<revision>-<variant>\` — immutable exact tag; \`8.1.34-r1-fpm\` is the first image built from PHP 8.1.34, \`8.1.34-r2-fpm\` the rebuild after an OS CVE fix"
+  echo "- \`ghcr.io/muffetlab/php:<minor>-<variant>\` — the recommended deploy tag; it floats, and only within its own series"
+  echo "- \`ghcr.io/muffetlab/php:<full-php-version>-r<revision>-<variant>\` — the immutable exact tag; \`8.1.34-r1-fpm\` is the first image built from PHP 8.1.34, \`8.1.34-r2-fpm\` the next build of it"
   echo
-  echo "Four things each carry one job, and none of them is \"which PHP version to"
-  echo "build\": a git tag (\`v1.0.0\`) marks the source commit a release was made from,"
-  echo "the workflow_dispatch \`version\` input picks the scope (\`all\` or one series),"
-  echo "\`manifests/<series>.env\` holds the PHP version, and the Docker tag names the"
-  echo "image that came out. Adding a series is a new manifest plus a new row in the"
-  echo "allowlist -- the release mechanism does not change."
+  echo "There is no \`latest\` tag published for any variant: neither name above is one, and"
+  echo "\`<minor>-<variant>\` is the only name that moves -- it cannot change major"
+  echo "version. Choose the series from the table above."
+  echo "MAINTAINING.md (\"Publishing images\") holds the rest of the model: why no"
+  echo "\`latest\` is published, what each of the four release inputs carries, and how a"
+  echo "run decides which series to build."
   echo
-  echo "There is no \`latest\` tag, and none is published for any variant: a release run"
-  echo "publishes the series it selects -- one series for a single-series dispatch,"
-  echo "every supported series at once for \`version=all\` -- so a \`latest\` name"
-  echo "would resolve to whichever series was released last: not the newest, and an"
-  echo "unrelated rebuild of one series could move it backwards. \`<minor>-<variant>\` is"
-  echo "the only floating name and it cannot change major version. Choose the series"
-  echo "from the table above; MAINTAINING.md (\"Publishing"
-  echo "images\") records why."
-  echo
-  echo "Every name above is written by one release run -- a manual dispatch of"
-  echo "\`release.yml\` that names the scope (\`all\` or a series) and the image revision,"
-  echo "from a commit that carries a \`vX.Y.Z\` source release tag. Both names are"
-  echo "written by the same run for each series it publishes."
+  echo "Exact tags are never moved, so the highest revision the registry serves is also"
+  echo "the newest image: a deployment that pinned an exact name has to move to a newer"
+  echo "revision -- or to \`<minor>-<variant>\` -- to receive a fix."
   echo
   reg_tok="$(ghcr_token)"
   tags_list="$(registry_tags_list "$reg_tok")"
@@ -275,15 +354,36 @@ current_exact_tag() {
     exit 1
   fi
   gen_stamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  # Every document that names a tag to pull states that no `latest` tag is published, and
+  # that sentence is about the registry as much as about the pipeline: a `latest-<variant>`
+  # left in the namespace by a manual push would make it false while every job stayed
+  # green, because no release writes or moves such a name. The tag list is already in
+  # hand, so the claim is checked where it is made rather than asserted -- and a real
+  # `latest` is a different thing from an unexpected name, so it stops the run instead of
+  # being disclosed as a row a reader might mistake for a published series.
+  stray_latest="$(printf '%s\n' "$tags_list" | grep -E '^latest(-|$)' | LC_ALL=C sort | tr '\n' ' ' || true)"
+  if [ -n "${stray_latest// /}" ]; then
+    echo "::error::${GHCR_HOST}/${GHCR_REPO} serves ${stray_latest}; README, DEPLOYING.md, SUPPORTED.md and MAINTAINING.md all state that no latest tag is published, so either the name goes or the documents stop saying that -- generation stops rather than write a page contradicted by the registry" >&2
+    exit 1
+  fi
+  # Names outside the two published shapes are disclosed instead of failing: they are the
+  # registry's answer to a question the documents do not make, and the section below
+  # would otherwise read as complete while leaving them out.
+  other_names="$(printf '%s\n' "$tags_list" \
+    | grep -Ev '^[0-9]+\.[0-9]+-(cli|fpm)$|^[0-9]+\.[0-9]+\.[0-9]+(-r[0-9]+)?-(cli|fpm)$' \
+    | LC_ALL=C sort | tr '\n' ' ' || true)"
   listed_any=0
-  echo "Which tags exist is a live registry fact: this generator reads \`/tags/list\`"
-  echo "with an anonymous pull-scope token and records what it answers, at the"
-  echo "time stamped below. A series appears when the registry serves its"
-  echo "variants; for each variant the row names the floating tag and the exact"
-  echo "tag with the highest image revision the registry serves, and the two must"
-  echo "resolve to the same digest (an older revision for the same version may"
-  echo "still be in the registry as the snapshot it is, and is not compared). The"
-  echo "generator fails the run if they do not:"
+  echo "### What the registry serves right now"
+  echo
+  echo "Which tags exist is a registry fact, not a repository one, so this section is"
+  echo "the registry's own answer to the question, read at the time stamped below. A"
+  echo "series appears when the registry serves its variants; for each variant the row"
+  echo "names the floating tag, the exact tag of the highest image revision, and the"
+  echo "digest both names resolve to. A series with no row here has not been published"
+  echo "by a release run that selected it -- a complete, approved manifest is a"
+  echo "precondition for a release, not a claim that one happened."
+  echo
+  echo "What it answered, per series and variant:"
   echo
   echo "<!-- generated at ${gen_stamp} -->"
   for v in $SUPPORTED_VERSIONS; do
@@ -319,46 +419,34 @@ current_exact_tag() {
   if [ "$listed_any" = 0 ]; then
     echo "- No tags for any series at generation time."
   fi
+  if [ -z "${other_names// /}" ]; then
+    echo
+    echo "The same list holds no other name: what the registry answered at the timestamp"
+    echo "above is exactly the two names per series and variant printed here. That is read,"
+    echo "not asserted -- a \`latest\`-shaped name stops this generator, and any other name"
+    echo "outside these two shapes would be listed rather than left out."
+  else
+    echo
+    echo "The same list also serves: ${other_names}. No release run writes a name of that"
+    echo "shape, so none of those is what a deployment should pull; the two names a run"
+    echo "does write are the ones listed above, and MAINTAINING.md (\"Publishing images\")"
+    echo "describes them."
+  fi
   echo
   echo "Each tag is a multi-arch manifest list covering \`linux/amd64\` and"
   echo "\`linux/arm64\`; \`docker pull\` selects the matching platform automatically."
   echo "There are no architecture-suffixed tags."
   echo
-  echo "The OpenSSL route is not part of a tag name: the release pipeline fixes one"
-  echo "route per series (5.6 -> \`openssl11\`, everything else -> \`openssl3\`), so a"
-  echo "suffix could not express a choice. It is in \`BUILD-PROVENANCE\` and the"
-  echo "\`dev.php-legacy.openssl-route\` label instead, and the per-version table above"
-  echo "lists it."
+  echo "The OpenSSL route is not part of a tag name either: one route is fixed per"
+  echo "series, so a suffix could express no choice a deployment makes. The"
+  echo "\`OpenSSL route\` column above is the answer, and the image carries it in"
+  echo "\`/opt/php/BUILD-PROVENANCE\` and the \`dev.php-legacy.openssl-route\` label."
   echo
-  echo "Exact tags are never moved, and there is one per image built from a PHP"
-  echo "version: \`8.1.34-r1-cli\` is the first, and \`8.1.34-r2-cli\` the rebuild that"
-  echo "carries an OS security fix -- the PHP version did not change, the image"
-  echo "revision did. Reading the highest revision out of the registry is therefore"
-  echo "the same as reading the newest image, and a deployment can pin an exact name"
-  echo "knowing it will always mean the bytes it was first pushed as. The name that"
-  echo "moves is \`<minor>-<variant>\`, which every release run repoints at that run's"
-  echo "build, so a deployment that pinned an exact name has to move to the newer"
-  echo "revision (or to \`<minor>-<variant>\`) to receive a fix."
-  echo
-  echo "A git tag is not part of an image name and does not pick a PHP version:"
-  echo "\`v1.0.0\` marks the source commit a release was made from, and a run refuses"
-  echo "to publish from a commit that carries no such tag."
-  echo
-  echo "Every published image embeds \`/opt/php/BUILD-PROVENANCE\` (base image digest,"
-  echo "source repo/ref/commit, OpenSSL route and version, PECL extension pins,"
-  echo "Composer version + phar digest, patch tree SHA-256 list, build date) plus"
-  echo "\`/opt/php/BUILD-DEPS\` and \`/opt/php/BUILD-CLEANUP\` (the effective build package"
-  echo "list, and whether the PHP source tree was shipped and what it weighed), and"
-  echo "matching OCI labels; release pushes attach provenance/SBOM attestations where"
-  echo "the registry supports them."
-  echo
-  echo "Only rows whose manifest is fully pinned **and** \`PATCHSET_APPROVED=1\` are ever"
-  echo "built and published. A release run publishes the series it selects -- one for a"
-  echo "single-series dispatch, all supported series for a \`version=all\`"
-  echo "dispatch -- and a selected series whose manifest is unpinned or unapproved fails"
-  echo "the whole run rather than publishing part of a release quietly; a full release"
-  echo "checks every selected manifest before it pushes any image."
-  echo "Series a release did not select are skipped, not force-released."
+  echo "Every row above is a claim about an image, and every claim is checkable in the"
+  echo "image: [DEPLOYING.md](DEPLOYING.md) (\"Checking what an image actually"
+  echo "contains\") names the files to read, and"
+  echo "[MAINTAINING.md](MAINTAINING.md) (\"Publishing images\") records what writes them"
+  echo "and what is attested to the registry."
 } > "${OUT}.tmp"
 
 mv "${OUT}.tmp" "$OUT"

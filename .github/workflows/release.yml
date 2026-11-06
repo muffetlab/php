@@ -430,7 +430,10 @@ jobs:
           modern_pin="$(sed -n 's/.*policy_ver="\(2\.[0-9.]*\)".*/\1/p' Dockerfile | head -1)"
           [ -n "$legacy_pin" ] || err "Dockerfile: legacy Composer pin not found"
           [ -n "$modern_pin" ] || err "Dockerfile: modern Composer pin not found"
-          for f in build.sh .github/workflows/build-version.yml tools/gen-supported.sh README.md MAINTAINING.md SUPPORTED.md; do
+          # Keep this list identical to the same step in build-and-verify.yml: the
+          # doc that must carry both pins is DEPLOYING.md's per-series table, not
+          # README.md, which points there instead of quoting the numbers.
+          for f in build.sh .github/workflows/build-version.yml tools/gen-supported.sh DEPLOYING.md MAINTAINING.md SUPPORTED.md; do
             grep -Fq "$legacy_pin" "$f" || err "$f: missing Composer pin $legacy_pin"
             grep -Fq "$modern_pin" "$f" || err "$f: missing Composer pin $modern_pin"
           done

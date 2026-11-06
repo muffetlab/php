@@ -203,8 +203,9 @@ measured on 2026-10-31 against exactly that pinned image (`docker inspect`
 reports `sha256:e5b6442dd2e9684cf5e87d8338b5968f3b348636fc0be6d7850a381e3731a2bd`,
 the digest in the manifest).
 
-- **Bullseye is out of support.** The Debian LTS page gives its window as
-  "2024-08-15 - 2026-08-31", which closed two months ago. The `bullseye-security`
+- **Bullseye reached the end of its Debian LTS window on 2026-08-31.** The Debian
+  LTS page gives that window as "2024-08-15 - 2026-08-31", and the measurement
+  above is from 2026-10-31, two months after it closed. The `bullseye-security`
   `Release` file on both `deb.debian.org` and `archive.debian.org` carries the
   same `Date: Sat, 12 Sep 2026 09:27:08 UTC` and no `Valid-Until` header: the
   index stopped advancing, so no
@@ -390,8 +391,8 @@ re-derive it.
   variant, `tests/extensions.sh` and `tests/composer.sh` against the image it
   built, after the `validate` gate. That chain runs in test mode, so all the
   `merge` jobs were skipped and **nothing was published to a registry**: a green
-  CI row is evidence the image builds and behaves, not evidence that a tag
-  exists to pull.
+  CI row is evidence the image passes the project's CI build and runtime checks,
+  not evidence that a tag exists to pull.
 - The publish record for a series — which tags exist and what digest each
   resolves to — used to be tabled in this file, series by series (7.4 first on
   2026-11-01, the remaining six verified against the registry on 2026-11-03).
@@ -509,7 +510,8 @@ What `tested-in-CI` does **not** claim, and what no row should be read as:
   Which tags exist, and the digest each resolves to today, is read from the
   registry by `tools/gen-supported.sh` into SUPPORTED.md — this file's row is
   not that fact. A green CI row is evidence
-  the image builds and behaves; it has never been evidence that a tag exists.
+  the image passes the project's CI build and runtime checks; it has never been
+  evidence that a tag exists.
 - **The CVE hunks are still untested.** The suite exercises the extension surface
   and the FPM pool, not the bailout fix; see the caveats under the CVE table.
 - **It is not an approval.** Moving a row to an `approved-*` status still needs a
