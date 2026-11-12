@@ -1,0 +1,10 @@
+.DS_Store
+# release artifacts
+*.tar.gz
+# generated file is committed on purpose (CI checks drift); keep no backups
+SUPPORTED.md.tmp
+# npm dev tooling lives in node_modules/; package.json and package-lock.json
+# are committed so anyone checking out a tagged commit can run `npm run release`
+# and get the same bump, changelog and tag, but node_modules is install-time
+# state.
+node_modules/

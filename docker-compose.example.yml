@@ -1,0 +1,73 @@
+# Example: all FPM variants on one internal network behind Nginx.
+# In production, run only the versions your application actually needs.
+# CLI variant images are for one-shot/exec workloads, not services:
+#   docker run --rm ghcr.io/muffetlab/php:8.1-cli php script.php
+
+x-php-hardening: &php-hardening
+  restart: unless-stopped
+  expose:
+    - "9000"
+  networks:
+    - app-internal
+  read_only: true
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  tmpfs:
+    - /tmp
+  # The app must sit at the SAME path here and in the nginx service below: nginx
+  # sends SCRIPT_FILENAME as a string and php-fpm opens it in this container's
+  # filesystem, so different paths give "Primary script unknown".
+  volumes:
+    - ./app:/var/www/html:ro
+  # Do not publish 9000 on the host.
+
+services:
+  php56:
+    <<: *php-hardening
+    image: ghcr.io/muffetlab/php:5.6-fpm
+
+  php70:
+    <<: *php-hardening
+    image: ghcr.io/muffetlab/php:7.0-fpm
+
+  php71:
+    <<: *php-hardening
+    image: ghcr.io/muffetlab/php:7.1-fpm
+
+  php72:
+    <<: *php-hardening
+    image: ghcr.io/muffetlab/php:7.2-fpm
+
+  php73:
+    <<: *php-hardening
+    image: ghcr.io/muffetlab/php:7.3-fpm
+
+  php74:
+    <<: *php-hardening
+    image: ghcr.io/muffetlab/php:7.4-fpm
+
+  php80:
+    <<: *php-hardening
+    image: ghcr.io/muffetlab/php:8.0-fpm
+
+  php81:
+    <<: *php-hardening
+    image: ghcr.io/muffetlab/php:8.1-fpm
+
+  nginx:
+    image: nginx:stable
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    networks:
+      - app-internal
+    volumes:
+      - ./app:/var/www/html:ro
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+
+networks:
+  app-internal:
+    internal: true

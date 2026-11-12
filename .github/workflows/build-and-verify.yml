@@ -1,0 +1,574 @@
+name: build-and-verify
+
+# CI policy:
+# - validate: static gate only (shellcheck, manifest/route/repo policy, patch
+#   SHA-256 vs review records). Never builds; works with unfilled templates.
+# - Per-version build jobs are chained sequentially (5.6 -> 7.x -> 8.x) to
+#   enforce the bring-up discipline: do not compile the whole series in
+#   parallel until 5.6's toolchain is proven. Each job skips a variant whose
+#   manifest is unfilled or does not declare it — CI cannot replace the human
+#   review gates (PATCHSET_APPROVED, digest pinning, commit pinning).
+#   This is the only place the whole series is still walked: a PR has to test
+#   everything, while release.yml publishes the one series a tag names.
+# - Full PHP compilation is slow (up to hours per version). Consider
+#   self-hosted runners; GHA layer cache is enabled to speed up rebuilds.
+#   Every action here is a Node 24 release (checkout v7, build-push v7,
+#   artifact v7/v8), which requires Actions runner >= 2.327.1 — GitHub-hosted
+#   runners satisfy that, an older self-hosted runner cannot run them.
+# - Manual dispatch with release=true additionally exports image tarballs as
+#   artifacts for the versions that built.
+# - Manual dispatch with trial_version + trial_base builds ONE series on a
+#   candidate Debian base instead of running the chain: see the trial jobs below.
+# - Triggers: pull_request and manual dispatch only. This workflow never runs on
+#   a push, because release.yml is the only workflow that publishes and a branch
+#   push here would build the same chain beside a release run. Their concurrency
+#   groups differ (build-and-verify-<ref> vs
+#   release-<ref>), so a shared trigger could not cancel one against the other:
+#   one push would run two full 8-version chains at once, racing the same GHA
+#   layer-cache scopes (php-<version>-<variant>-<arch>). tools/check-image-name.sh
+#   asserts this absence -- do not add a push: trigger back here.
+#   The known cost is that a direct push to master is no longer verified in CI,
+#   so land work through a PR; workflow_dispatch remains the escape hatch (and a
+#   re-dispatch cancels the in-flight chain, which is hours long).
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Export built images as artifacts (release job)"
+        type: boolean
+        default: false
+      trial_version:
+        description: "Trial: build only this series (5.6/7.0/7.1/7.2/7.3/7.4/8.0/8.1) on trial_base, skipping the chain. Empty = run the chain."
+        type: string
+        required: false
+        default: ""
+      trial_base:
+        description: "Trial base image: a tag such as debian:forky-slim (CI resolves its digest), or an already digest-pinned reference"
+        type: string
+        required: false
+        default: ""
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Keep in sync with build.sh SUPPORTED_VERSIONS.
+  SUPPORTED_VERSIONS: "5.6 7.0 7.1 7.2 7.3 7.4 8.0 8.1"
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install shellcheck and jq
+        run: sudo apt-get update && sudo apt-get install -y shellcheck jq
+
+      - name: Shellcheck scripts
+        run: |
+          # Glob, do not enumerate: a new script must be linted without anyone
+          # remembering to add it to a list in three workflows.
+          mapfile -t files < <(find . -name '*.sh' -not -path './.git/*' | sort)
+          printf 'shellcheck: %s\n' "${files[@]}"
+          shellcheck -x "${files[@]}"
+
+      - name: Bash syntax check
+        run: |
+          mapfile -t files < <(find . -name '*.sh' -not -path './.git/*' | sort)
+          bash -n "${files[@]}"
+
+      - name: Dockerfile RUN shell syntax
+        run: ./tools/lint-dockerfile-shells.sh
+
+      - name: Verify-script harness
+        run: |
+          ./tests/verify-harness.sh
+
+      # The OS gate's verdict logic, stubbed: no image, no apt, no scanner --
+      # and that is the point. It asserts that a run with no scanner is
+      # `unverified` and exits 1 rather than reporting `clean`.
+      - name: OS gate verdict harness
+        run: |
+          ./tests/scan-image-harness.sh
+
+      # The release planner's arithmetic, stubbed: fake manifests and a fake
+      # registry read. It asserts the two directions that are easy to get
+      # backwards -- a series whose pins already match is skipped, and a series
+      # whose build record cannot be read is published rather than skipped.
+      - name: Release-plan harness
+        run: |
+          ./tests/release-plan-harness.sh
+
+      - name: Version-branch inventory in sync
+        run: |
+          ./tools/list-version-branches.sh
+          ./tools/list-version-branches.sh --check
+
+      # The Dockerfile owns the extension baseline and five scripts carry a
+      # fallback copy of it. A copy that loses a name does not fail anything on
+      # its own -- it quietly checks a smaller set than the image promises -- so
+      # the copies are compared to the Dockerfile here instead of by review.
+      - name: Extension baseline copies in sync
+        run: ./tools/check-ext-baseline.sh --check
+
+      # The one tool in the repository that turns a text file into a write
+      # against someone else's service. Its JSON escaping and link rewriting are
+      # the failure modes nobody sees: a payload that is invalid JSON or ships
+      # half-relative links still gets a 200 back, and the damage is a broken
+      # Overview page read later by a stranger. So the assertions run here, on
+      # the same Ubuntu sed/awk the release step will use, with no network and
+      # no credentials.
+      - name: Docker Hub README sync self-test
+        run: ./tools/sync-dockerhub-readme.sh --self-test
+
+      - name: SUPPORTED.md up to date
+        run: |
+          # The generator reads the tree and nothing else, so this comparison is
+          # byte-exact: no timestamp line, no registry answer, no outage to
+          # excuse a difference.
+          ./tools/gen-supported.sh
+          if ! git diff --quiet -- SUPPORTED.md; then
+            echo "::error::SUPPORTED.md is stale; run tools/gen-supported.sh and commit"
+            git diff -- SUPPORTED.md
+            exit 1
+          fi
+
+      - name: Manifest policy check
+        run: |
+          set -eu
+          fail=0
+          err() { echo "::error::$*"; fail=1; }
+          for v in $SUPPORTED_VERSIONS; do
+            [ -f "manifests/$v.env" ] || err "missing manifests/$v.env"
+          done
+          for f in manifests/*.env; do
+            ver="$(basename "$f" .env)"
+            case " $SUPPORTED_VERSIONS " in
+              *" $ver "*) ;;
+              *) err "$f: version not in supported list"; continue ;;
+            esac
+            # Trusted project config, not untrusted input.
+            # shellcheck source=/dev/null
+            . "./$f"
+            case "${OPENSSL_ROUTE:-}" in openssl11|openssl3) ;; *) err "$f: bad OPENSSL_ROUTE" ;; esac
+            if [ "$ver" = "5.6" ] && [ "${OPENSSL_ROUTE:-}" != "openssl11" ]; then
+              err "$f: 5.6 requires openssl11"
+            fi
+            if [ "$ver" != "5.6" ] && [ "${OPENSSL_ROUTE:-}" != "openssl3" ]; then
+              err "$f: $ver requires openssl3"
+            fi
+            # Source of record for every series is the backports fork: the
+            # official php/php-src tree ships no security fixes for an EOL line.
+            # Moving a manifest to official php-src is a reviewed change to this
+            # policy, to build.sh and to the Dockerfile guard -- not a manifest
+            # edit.
+            case "${PHP_SRC_REPO:-}" in
+              *php-src-backports*) ;;
+              "") err "$f: PHP_SRC_REPO unset" ;;
+              *) err "$f: PHP_SRC_REPO must be shivammathur/php-src-backports (got '${PHP_SRC_REPO:-}')" ;;
+            esac
+            if ! printf '%s' "${PHP_SRC_COMMIT:-}" | grep -Eq '^[0-9a-f]{40}$'; then
+              err "$f: PHP_SRC_COMMIT must be a full 40-character commit SHA"
+            fi
+            # "@sha256:" alone is not a pin: an unfilled manifest ships
+            # "@sha256:REPLACE_WITH_DIGEST". Require 64 hex, but report it as an
+            # unready manifest (build jobs skip it) rather than a validate
+            # failure.
+            case "${BASE_IMAGE:-}" in
+              *@sha256:*)
+                digest="${BASE_IMAGE##*@sha256:}"
+                if ! printf '%s' "$digest" | grep -Eq '^[0-9a-f]{64}$'; then
+                  case "$digest" in
+                    REPLACE_WITH*)
+                      echo "::warning::$f: BASE_IMAGE digest is still a placeholder; run tools/resolve-base-digest.sh in CI and fill it before this version builds" ;;
+                    *)
+                      echo "::warning::$f: BASE_IMAGE digest '${digest}' is not 64 lowercase hex -- this manifest is not buildable yet (run tools/resolve-base-digest.sh in CI)" ;;
+                  esac
+                fi
+                ;;
+              "") err "$f: BASE_IMAGE unset" ;;
+              *) err "$f: BASE_IMAGE must be pinned by digest (repo@sha256:<64 hex>)" ;;
+            esac
+            variants="${BUILD_VARIANTS:-}"
+            [ -n "$variants" ] || err "$f: BUILD_VARIANTS empty"
+            for vv in $variants; do
+              case "$vv" in cli|fpm) ;; *) err "$f: bad BUILD_VARIANTS entry '$vv'" ;; esac
+            done
+            case "${PATCHSET_APPROVED:-}" in 0|1) ;; *) err "$f: PATCHSET_APPROVED must be 0 or 1" ;; esac
+            # apt lists are interpolated unquoted into apt-get inside the image
+            # build, so they must be plain Debian package specifications
+            # (name[:arch][=version]) -- same rule build.sh enforces.
+            pkg_re='^[A-Za-z0-9][A-Za-z0-9.+-]*(:[A-Za-z0-9.+-]+)?(=[A-Za-z0-9.+:~-]+)?$'
+            for plist in BUILD_PACKAGES RUNTIME_PACKAGES; do
+              eval "plistval=\${$plist:-}"
+              # shellcheck disable=SC2086
+              for tok in $plistval; do
+                printf '%s' "$tok" | grep -Eq "$pkg_re" \
+                  || err "$f: $plist contains an invalid package specification '$tok'"
+              done
+            done
+            # 1 = ship the configured source tree (official-image parity), 0 =
+            # omit it to keep the image small. Only those two are valid.
+            case "${SHIP_PHP_SOURCE:-1}" in 0|1) ;; *) err "$f: SHIP_PHP_SOURCE must be 0 or 1" ;; esac
+            # PHP_EXTENSIONS / PECL_EXTENSIONS add to the kit baseline and are
+            # interpolated unquoted into build-stage shell, so they get the same
+            # kind of shape check as the apt lists (an extension name is
+            # [a-z0-9_]). Which names a series can build at all is the
+            # Dockerfile's availability table -- deliberately not duplicated
+            # here.
+            ext_re='^[a-z0-9_]+$'
+            for elist in PHP_EXTENSIONS PECL_EXTENSIONS; do
+              eval "elistval=\${$elist:-}"
+              # shellcheck disable=SC2086
+              for tok in $elistval; do
+                printf '%s' "$tok" | grep -Eq "$ext_re" \
+                  || err "$f: $elist contains an invalid extension name '$tok'"
+              done
+            done
+            # Optional Composer overrides must respect the series policy.
+            cv="${COMPOSER_VERSION:-}"
+            cs="${COMPOSER_SHA256:-}"
+            case "$ver" in 5.6|7.0|7.1) policy_cv="1.10.28" ;; *) policy_cv="2.11.0" ;; esac
+            if [ -n "$cv" ]; then
+              if ! printf '%s' "$cv" | grep -Eq '^(1\.10|2)(\.[0-9]+)+$'; then
+                err "$f: COMPOSER_VERSION must be an exact 1.10.x or 2.x release (got '$cv')"
+              fi
+              case "$ver:$cv" in
+                5.6:2.*|7.0:2.*|7.1:2.*)
+                  err "$f: PHP $ver cannot run Composer 2.x (requires PHP >= 7.2.5)" ;;
+              esac
+              if [ -z "$cs" ] && [ "$cv" != "$policy_cv" ]; then
+                echo "::warning::$f: COMPOSER_VERSION=$cv overrides the policy pin without COMPOSER_SHA256"
+              fi
+            fi
+            if [ -n "$cs" ] && ! printf '%s' "$cs" | grep -Eq '^[0-9a-f]{64}$'; then
+              err "$f: COMPOSER_SHA256 must be 64 lowercase hex chars"
+            fi
+          done
+          [ "$fail" = 0 ]
+
+      - name: Source pin drift report
+        # Advisory only. Compares each PHP_SRC_COMMIT with the current tip of
+        # its tag on the backports fork. Drift means "the maintainer retagged,
+        # decide whether to follow", and following means re-reviewing the
+        # patchset that comes with the new commits — it is not a broken
+        # pipeline. continue-on-error additionally covers a flaky remote.
+        continue-on-error: true
+        run: ./tools/check-pin-drift.sh
+
+      - name: Base image digest report
+        # Prints the digest each base tag currently resolves to, and flags every
+        # manifest still carrying "@sha256:REPLACE_WITH_DIGEST". Nothing is
+        # written: filling a digest is a human commit, because it is the same
+        # class of security decision as pinning a source commit.
+        continue-on-error: true
+        run: ./tools/resolve-base-digest.sh --check
+
+      - name: Composer pins in sync
+        run: |
+          set -eu
+          fail=0
+          err() { echo "::error::$*"; fail=1; }
+          # The Composer policy pins are duplicated across the build layers by
+          # design (Dockerfile enforces, build.sh/CI pre-validate, docs
+          # describe). They must agree, so drift is caught here instead of at
+          # build time.
+          legacy_pin="$(sed -n 's/.*policy_ver="\(1\.10\.[0-9]*\)".*/\1/p' Dockerfile | head -1)"
+          modern_pin="$(sed -n 's/.*policy_ver="\(2\.[0-9.]*\)".*/\1/p' Dockerfile | head -1)"
+          [ -n "$legacy_pin" ] || err "Dockerfile: legacy Composer pin not found"
+          [ -n "$modern_pin" ] || err "Dockerfile: modern Composer pin not found"
+          echo "Dockerfile pins: legacy=$legacy_pin modern=$modern_pin"
+          # The doc half of the list is the file that actually states the
+          # numbers: DEPLOYING.md's "What each series is built against" table,
+          # not README.md, which names the categories and points there. Adding a
+          # doc to this list means requiring it to carry both pins.
+          for f in build.sh .github/workflows/build-version.yml tools/gen-supported.sh DEPLOYING.md MAINTAINING.md SUPPORTED.md; do
+            grep -Fq "$legacy_pin" "$f" || err "$f: missing Composer pin $legacy_pin"
+            grep -Fq "$modern_pin" "$f" || err "$f: missing Composer pin $modern_pin"
+          done
+          [ "$fail" = 0 ]
+
+      - name: Published image address in sync
+        run: ./tools/check-image-name.sh
+
+      - name: Composer installer pin freshness
+        run: |
+          set -euo pipefail
+          pinned_commit="$(sed -n 's/^ARG COMPOSER_INSTALLER_COMMIT=\([0-9a-f]\{40\}\)$/\1/p' Dockerfile)"
+          pinned_sha="$(sed -n 's/^ARG COMPOSER_INSTALLER_SHA256=\([0-9a-f]\{64\}\)$/\1/p' Dockerfile)"
+          [ -n "$pinned_commit" ] && [ -n "$pinned_sha" ] || {
+            echo "::error::COMPOSER_INSTALLER_COMMIT/SHA256 pins not found in Dockerfile"; exit 1; }
+          upstream="$(curl -fsSL --retry 3 --max-time 60 https://getcomposer.org/installer | sha256sum | awk '{print $1}')" || {
+            echo "::warning::could not fetch getcomposer.org/installer; skipping freshness check"; exit 0; }
+          if [ "$upstream" != "$pinned_sha" ]; then
+            echo "::warning::upstream Composer installer ($upstream) no longer matches the pin ($pinned_sha); review and bump COMPOSER_INSTALLER_* if intentional"
+          else
+            echo "Composer installer pin matches upstream (commit $pinned_commit)."
+          fi
+
+      - name: Vendored docker-php-ext hash check
+        run: |
+          set -eu
+          (cd docker-php-ext && shasum -a 256 -c SHA256SUMS)
+          # The commit pinned in the Dockerfile must match the vendoring record.
+          dockerfile_sha="$(sed -n 's/^ENV DOCKER_PHP_EXT_SRC_COMMIT=\([0-9a-f]\{40\}\)$/\1/p' Dockerfile)"
+          [ -n "$dockerfile_sha" ] || { echo "::error::DOCKER_PHP_EXT_SRC_COMMIT pin not found in Dockerfile"; exit 1; }
+          grep -q "$dockerfile_sha" docker-php-ext/README.md || {
+            echo "::error::Dockerfile pin $dockerfile_sha not recorded in docker-php-ext/README.md"; exit 1; }
+
+      - name: Patch review record check
+        run: |
+          set -eu
+          fail=0
+          err() { echo "::error::$*"; fail=1; }
+          for dir in patches/*/; do
+            [ -d "$dir" ] || continue
+            ver="$(basename "$dir")"
+            case " $SUPPORTED_VERSIONS " in
+              *" $ver "*) ;;
+              *) err "$dir: unsupported version directory"; continue ;;
+            esac
+            for p in "$dir"*.patch; do
+              [ -e "$p" ] || continue
+              rec=""
+              for r in "$dir"REVIEW-*.md; do
+                [ -e "$r" ] || continue
+                if grep -Fqi "$(basename "$p")" "$r"; then rec="$r"; break; fi
+              done
+              if [ -z "$rec" ]; then
+                err "$p: no review record (REVIEW-*.md referencing this file)"
+                continue
+              fi
+              hash="$(sha256sum "$p" | awk '{print $1}')"
+              if ! grep -Fq "$hash" "$rec"; then
+                err "$p: SHA-256 $hash not recorded in $rec"
+              fi
+            done
+          done
+          [ "$fail" = 0 ]
+
+  # --- Base-image trial channel ----------------------------------------------
+  # A base image is the same class of decision as a source pin: a human reviews
+  # it and a human commits it. What CI can supply is the evidence, which is a
+  # real build -- same Dockerfile, same suites, same OS CVE scan -- on a
+  # candidate Debian release, without any manifest changing. Dispatch
+  # trial_version + trial_base to get exactly that: one series, built twice in
+  # effect (once here on the candidate, the numbers to compare come from the
+  # same series' regular chain run), never pushed.
+  #
+  # build-version.yml refuses base_image_override together with push=true, and
+  # this workflow never passes push at all, so a trial cannot publish even if
+  # someone edits the dispatch form. The override also has to arrive digest-
+  # pinned, which is why the digest is resolved in a job of its own rather than
+  # interpolated into the caller.
+
+  trial-base:
+    # Either input alone counts as a request: the job then fails with the reason
+    # instead of the run quietly doing neither a trial nor a chain.
+    # needs.validate is spelled out because a job with its own `if` no longer
+    # inherits the implicit "only if every needed job succeeded" gate -- without
+    # it a trial resolver would run after a failed validate.
+    if: ${{ needs.validate.result == 'success' && github.event_name == 'workflow_dispatch' && (inputs.trial_version != '' || inputs.trial_base != '') }}
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      base_image: ${{ steps.resolve.outputs.base_image }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        # resolve-base-digest.sh asks the registry through buildx imagetools,
+        # which needs no pull and no daemon state for the image itself.
+        uses: docker/setup-buildx-action@v4
+
+      - name: Check the trial request
+        env:
+          TRIAL_VERSION: ${{ inputs.trial_version }}
+          TRIAL_BASE: ${{ inputs.trial_base }}
+        run: |
+          set -eu
+          if [ -z "$TRIAL_VERSION" ] || [ -z "$TRIAL_BASE" ]; then
+            echo "::error::a trial needs both trial_version and trial_base (got trial_version='${TRIAL_VERSION}', trial_base='${TRIAL_BASE}')"
+            exit 1
+          fi
+          case " ${SUPPORTED_VERSIONS} " in
+            *" ${TRIAL_VERSION} "*) ;;
+            *)
+              echo "::error::trial_version '${TRIAL_VERSION}' is not a supported series (${SUPPORTED_VERSIONS})"
+              exit 1
+              ;;
+          esac
+          # 5.6 is a supported series and an impossible trial: its route needs a
+          # base that ships OpenSSL 1.1, and no Debian release from bookworm
+          # onwards does. Warn rather than refuse -- the build stage's own
+          # OpenSSL-major assertion is the authority, and a maintainer may want
+          # that log line as the evidence. Costing an apt "no candidate" instead
+          # of an hour of compile is the only thing this notice can buy.
+          if [ "${TRIAL_VERSION}" = "5.6" ] && ! printf '%s' "$TRIAL_BASE" | grep -q bullseye; then
+            echo "::warning::5.6 builds the openssl11 route; ${TRIAL_BASE} has no OpenSSL 1.1 candidate, so this trial is expected to fail in the build stage. That failure is the route assertion working, not a bug to override."
+          fi
+
+      - name: Resolve the trial base to a digest
+        id: resolve
+        env:
+          TRIAL_VERSION: ${{ inputs.trial_version }}
+          TRIAL_BASE: ${{ inputs.trial_base }}
+        run: |
+          set -eu
+          case "$TRIAL_BASE" in
+            *@sha256:*)
+              # Already pinned -- use it as given. Re-checking the shape is the
+              # caller's job too, so a hand-typed digest cannot silently pass.
+              pinned="$TRIAL_BASE"
+              echo "trial_base arrived digest-pinned; no registry lookup needed."
+              ;;
+            *)
+              pinned="$(./tools/resolve-base-digest.sh --base "$TRIAL_BASE" --value)"
+              ;;
+          esac
+          digest="${pinned##*@sha256:}"
+          if [ "$digest" = "$pinned" ] || ! printf '%s' "$digest" | grep -Eq '^[0-9a-f]{64}$'; then
+            echo "::error::trial base '${pinned}' is not repo[:tag]@sha256:<64 hex> -- an unpinned trial is a result nobody can reproduce"
+            exit 1
+          fi
+          echo "base_image=${pinned}" >> "$GITHUB_OUTPUT"
+          echo "::notice::TRIAL ${TRIAL_VERSION} on ${pinned}: test mode only, nothing is pushed. Compare its os-cve-* artifact and size report with the same series built on the manifest base."
+
+  build-trial:
+    needs: [validate, trial-base]
+    # Reached only when trial-base actually resolved a base. The result check is
+    # the whole condition (validate's outcome already gates trial-base), and a
+    # skipped trial-base -- no trial inputs -- reports 'skipped' here, not
+    # 'success', so the job stays out of the way of a normal chain run.
+    if: ${{ needs.trial-base.result == 'success' }}
+    uses: ./.github/workflows/build-version.yml
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    with:
+      version: ${{ inputs.trial_version }}
+      base_image_override: ${{ needs.trial-base.outputs.base_image }}
+    secrets:
+      token: ${{ secrets.GITHUB_TOKEN }}
+
+  # --- Sequential per-version build chain -----------------------------------
+  # Each job builds the cli and/or fpm variants declared in its manifest, on
+  # both linux/amd64 and linux/arm64 (native runners in build-version.yml), and
+  # runs smoke + extension tests on each. Unfilled manifests skip cleanly.
+  #
+  # The chain is the default, and a trial dispatch suspends it: one build job is
+  # hours long, and running eight of them to answer a question about one base
+  # image would burn the whole queue for a result nobody asked for. Gating the
+  # head of the chain is enough -- every later job needs the one before it, so a
+  # skipped build-5_6 skips the rest.
+
+  build-5_6:
+    needs: validate
+    if: ${{ needs.validate.result == 'success' && (github.event_name != 'workflow_dispatch' || (inputs.trial_version == '' && inputs.trial_base == '')) }}
+    uses: ./.github/workflows/build-version.yml
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    with:
+      version: "5.6"
+      release: ${{ github.event_name == 'workflow_dispatch' && inputs.release }}
+    secrets:
+      token: ${{ secrets.GITHUB_TOKEN }}
+
+  build-7_0:
+    needs: build-5_6
+    uses: ./.github/workflows/build-version.yml
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    with:
+      version: "7.0"
+      release: ${{ github.event_name == 'workflow_dispatch' && inputs.release }}
+    secrets:
+      token: ${{ secrets.GITHUB_TOKEN }}
+
+  build-7_1:
+    needs: build-7_0
+    uses: ./.github/workflows/build-version.yml
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    with:
+      version: "7.1"
+      release: ${{ github.event_name == 'workflow_dispatch' && inputs.release }}
+    secrets:
+      token: ${{ secrets.GITHUB_TOKEN }}
+
+  build-7_2:
+    needs: build-7_1
+    uses: ./.github/workflows/build-version.yml
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    with:
+      version: "7.2"
+      release: ${{ github.event_name == 'workflow_dispatch' && inputs.release }}
+    secrets:
+      token: ${{ secrets.GITHUB_TOKEN }}
+
+  build-7_3:
+    needs: build-7_2
+    uses: ./.github/workflows/build-version.yml
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    with:
+      version: "7.3"
+      release: ${{ github.event_name == 'workflow_dispatch' && inputs.release }}
+    secrets:
+      token: ${{ secrets.GITHUB_TOKEN }}
+
+  build-7_4:
+    needs: build-7_3
+    uses: ./.github/workflows/build-version.yml
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    with:
+      version: "7.4"
+      release: ${{ github.event_name == 'workflow_dispatch' && inputs.release }}
+    secrets:
+      token: ${{ secrets.GITHUB_TOKEN }}
+
+  build-8_0:
+    needs: build-7_4
+    uses: ./.github/workflows/build-version.yml
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    with:
+      version: "8.0"
+      release: ${{ github.event_name == 'workflow_dispatch' && inputs.release }}
+    secrets:
+      token: ${{ secrets.GITHUB_TOKEN }}
+
+  build-8_1:
+    needs: build-8_0
+    uses: ./.github/workflows/build-version.yml
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    with:
+      version: "8.1"
+      release: ${{ github.event_name == 'workflow_dispatch' && inputs.release }}
+    secrets:
+      token: ${{ secrets.GITHUB_TOKEN }}
