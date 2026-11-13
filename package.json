@@ -1,6 +1,6 @@
 {
   "name": "php-legacy-security-kit",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Security-backported Docker images for legacy PHP applications: PHP 5.6–8.1, in cli and fpm variants.",
   "repository": {
     "type": "git",
