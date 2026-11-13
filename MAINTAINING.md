@@ -594,6 +594,15 @@ The trixie migration is settled. The current rule, not the history:
   spells out `needs.validate.result == 'success'`, because a job with its own
   condition no longer inherits the implicit "only if every needed job succeeded"
   gate.
+- `.github/workflows/upstream-drift.yml`: the read-only upstream monitor, run
+  every second day at 02:17 UTC and by manual dispatch. It repeats the two
+  advisory checks above without entering the build chain. Actual source or base
+  drift creates or updates the fixed-title **Upstream pin drift report** Issue;
+  placeholders and unreachable upstreams do not open one. A clean run does not
+  close the Issue, because adopting a pin is a reviewed human change and a
+  network failure must not read as a resolution. The token has only
+  `contents: read` and `issues: write`; the job never edits a manifest, logs
+  into a registry or pushes an image.
 - `.github/workflows/build-version.yml`: reusable per-version job. Its matrix is
   `variant × arch` (`cli`/`fpm` on `linux/amd64` via `ubuntu-24.04` and on
   `linux/arm64` via the GitHub-hosted `ubuntu-24.04-arm`, natively, no QEMU), so
@@ -1086,6 +1095,7 @@ for is the table below.
 - `tools/`: the gates, generators and release readers
 - `docker-php-ext/`: the vendored official extension scripts
 - `.github/workflows/`: the validate gate, the build chain, the release pipeline
+  and the scheduled upstream-drift monitor
 - `docker-compose.example.yml`, `nginx.conf.example`: the worked FPM + Nginx example
 - `README.md`, `DEPLOYING.md`, `SUPPORTED.md`, `SECURITY.md`, `LICENSE`: consumer documents; `MAINTAINING.md` is this one
 
