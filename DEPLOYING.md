@@ -51,8 +51,8 @@ pull with no release cut on your side.
 
 **How do I pin a specific image?** Use an exact tag
 (`<php-version>-r<N>-<variant>`, e.g. `8.1.34-r1-fpm`) or a digest. Exact tags
-are immutable, so a pin stays on those bytes until you move it. A digest is the
-most exact pin of all.
+are immutable by pipeline rule, so a pin stays on those bytes until you move it.
+A digest is the most exact pin of all.
 
 **How do I get security updates?** Pull the floating `X.Y-<variant>` tag again.
 An exact tag never changes, so to receive a fix you move to the newer revision
