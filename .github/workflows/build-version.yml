@@ -1,0 +1,1190 @@
+name: build-version
+
+# Reusable single-version build: called for every supported series,
+# sequentially, by build-and-verify.yml (test mode), and by release.yml (push
+# mode) -- once per entry of the release matrix, so a run that selects one
+# series calls this once and a version=all run calls it once per supported
+# series.
+#
+# Builds the cli and/or fpm variants declared in manifests/<version>.env and
+# runs smoke + extension tests. Skips cleanly when the manifest is still an
+# unfilled template — the review gates (PATCHSET_APPROVED=1, digest pin, commit
+# pin) are human decisions and CI must not bypass them.
+#
+# A release caller can narrow that list without changing the manifest: inputs.variants
+# is the subset the plan step named for this run, which for a completion is only the
+# variants the registry does not already serve at the revision being finished. Both
+# jobs gate on it, because a leg that built the rest would push per-architecture
+# digests its own merge job is required to refuse to name -- the residue of a release
+# that had nothing to publish at that name.
+#
+# Push mode (push=true) is set only by release.yml, and honored only from a ref
+# that a human chose to release from: the default branch (refs/heads/main or
+# refs/heads/master), which is where a workflow_dispatch of release.yml runs, or a
+# conforming source release tag ref (refs/tags/vMAJOR.MINOR.PATCH), which is what a
+# tag push of release.yml runs on. Nothing else reaches a registry: no pull request,
+# no branch push, no tag whose name is not exactly a source release version. Two
+# more things make a push legitimate, and both are checked here rather than assumed:
+#   - source_release names the git tag of the source being published
+#     (vMAJOR.MINOR.PATCH). A git tag marks a *source release*; it selects no PHP
+#     version and contributes nothing to an image name, so the same tag can cover a
+#     release of every series. release.yml's guard requires the branch commit it
+#     dispatched from to carry such a tag -- or the pushed tag to be one -- and
+#     fails closed when it does not, so an image can never be published from
+#     untagged source; this workflow restates the rule at the one
+#     place that actually writes to a registry.
+#   - inputs.revision is the image revision, a positive integer, and it always
+#     appears in the exact published name (<php>-r<revision>-<variant>), which
+#     is immutable by pipeline rule. An OS security
+#     update therefore keeps the manifest's PHP version and moves r1 to r2; it does
+#     not invent a tag and never overwrites the r1 image.
+# build-and-verify.yml calls this workflow in test mode (push omitted, so false)
+# and no longer runs on any push: publishing belongs to release.yml alone. Its trial
+# dispatch adds a second kind of test-mode call: same manifest pins, same suites,
+# with base_image_override naming a candidate Debian base. That knob is refused
+# here when push=true, so "which base did we publish?" always has the manifest as
+# the answer -- and dev.php-legacy.base-image records the base a trial really used.
+#
+# What it publishes:
+#   - Published image is <registry>/<namespace>/php -- by default
+#     ghcr.io/muffetlab/php. The image name is literal ("php"); <namespace> is
+#     the GHCR owner, so a fork must pass its own namespace (its GitHub
+#     user/org) rather than editing this file.
+#   - tags: <registry>/<namespace>/php:<full-php-version>-r<revision>-<variant>
+#           <registry>/<namespace>/php:<minor>-<variant>   (floating)
+#           The PHP version comes from the manifest (SOURCE_REF) and the revision
+#           from the registry (release.yml's plan step, tools/release-plan.sh) --
+#           never from a git tag name. The exact name is a
+#           snapshot: 8.1.34-r1-cli is that build forever, and the next fix is
+#           published beside it as 8.1.34-r2-cli. Only <minor>-<variant> moves.
+#           The step below never rewrites an exact name; what inputs.mode decides
+#           is what finding one already there means -- a refused leg (publish: the
+#           plan read the registry and said this revision was new, so the registry
+#           moved under the run; refused by the per-arch leg before it pushes and
+#           again by the merge job, so a publish that cannot be made leaves nothing
+#           untagged behind) or the release being already half-published
+#           (complete: the plan read the registry, saw this variant current at this
+#           revision, and sent the series to be finished at it).
+#           No :latest-<variant>, and no plain :latest either. A release run
+#           publishes the series it selects, so "latest" would name whichever series
+#           someone released last -- not the newest PHP and not a recommendation, and an
+#           unrelated 7.4 rebuild would move it off 8.1. <minor>-<variant> is the
+#           only floating name, and it cannot change the major version.
+#           tools/check-image-name.sh fails if a latest tag comes back.
+#           (the OpenSSL route is deliberately NOT in the tag: the validate job
+#           pins one route per version -- 5.6 -> openssl11, every other series ->
+#           openssl3 -- so the suffix would carry no choice. The route stays in
+#           BUILD-PROVENANCE and the dev.php-legacy.openssl-route label.)
+#   - OCI provenance labels + /opt/php/BUILD-PROVENANCE inside the image
+#   - build provenance/SBOM attestations (GHCR supports them; disable via
+#     attestations=false for registries that do not)
+#   - optional Docker Hub mirror when DOCKERHUB_USERNAME/TOKEN secrets exist
+#
+# Multi-arch: the build matrix covers linux/amd64 and linux/arm64, each on a
+# native runner (ubuntu-24.04 and the GitHub-hosted ubuntu-24.04-arm, which is
+# free for public repositories). Every leg runs the full
+# smoke/extension/composer suite against the image it built, so neither
+# architecture is published on the strength of the other one's tests, and each
+# leg also runs the OS gate over the image's own Debian inventory before
+# anything is pushed. In push mode each leg uploads its image by digest (no
+# per-arch tag) and the merge job assembles the digests into one manifest list
+# per published tag -- a release cannot expose a single-arch tag even if one leg
+# fails, because the merge never runs. imagetools carries each platform's
+# provenance/SBOM attestation manifests into the list, and the merge job reads
+# the list back and says how many it found. Uploading by digest is not the same
+# as pushing: the exporter only publishes when its output spec says push=true,
+# and a leg that forgets it goes green having put nothing in the registry. The
+# push step therefore asks the registry for the digest it was just given before
+# recording it.
+#
+# Runner labels are pinned to Ubuntu 24.04 rather than "ubuntu-latest": GitHub
+# started moving ubuntu-latest to Ubuntu 26.04 on 2026-10-19 (complete by
+# 2026-11-19), and a floating label would change the host OS, its apt packages
+# and its Docker engine under an unattended build. 24.04 is also the release the
+# arm64 label still names, so both legs stay on one Ubuntu version.
+#
+# A private fork cannot use ubuntu-24.04-arm (arm64 hosted runners are free only
+# for public repositories): use a paid arm64 runner label there, or drop the
+# arm64 matrix entry and accept an amd64-only publish.
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+      # The image revision: the r<N> that appears in the exact published name
+      # (php:<full>-r<N>-<variant>), immutable by pipeline rule. It comes from
+      # release.yml's plan step, which derives it per PHP point version by
+      # reading the exact names already published in the registry -- not from a
+      # dispatch input and not from a git tag. It is mandatory in push mode
+      # because every exact name this pipeline writes is a revision: "the first
+      # build" is r1, and a leg that composed its name without one would publish
+      # a tag the plan cannot count past. An OS security update that does not
+      # move the PHP version moves this number instead, and the previous image
+      # stays pullable by name. The default is empty rather than "1" on purpose:
+      # a caller that forgets to say which revision it is publishing gets a
+      # refused push instead of a second image claiming to be the first build of
+      # that version.
+      revision:
+        required: false
+        type: string
+        default: ""
+      # What the plan step's verdict said about this revision. It changes nothing
+      # about what is built or what is published -- it changes what finding an
+      # exact name already in the registry means:
+      #   publish  -- the plan read the primary registry and proposed a revision it
+      #               found nothing at, so a name already there means the registry
+      #               moved under this run (a re-run without the concurrency group,
+      #               a manual push). Refusing is not caution for its own sake: the
+      #               series' other variant would otherwise be published beside that
+      #               name, giving one revision number two pinsets. The publish leg
+      #               is asked twice -- before the by-digest push and again at the
+      #               merge -- because the first answer is what keeps a refused
+      #               release from leaving the pushed manifests of a build nobody
+      #               will ever be able to name in the registry;
+      #   complete -- the plan found this variant already current at the newest
+      #               revision and sent the series to be finished at that revision,
+      #               so a name already there is this release being already
+      #               published: the snapshot is left untouched and the half that is
+      #               missing is what gets written.
+      # A mirror registry (Docker Hub) is never read by the plan, so a name already
+      # there is always the residue of a run that published elsewhere and failed
+      # here, and is skipped on that registry while the others are published.
+      # Default is the stricter of the two, so a caller that says nothing cannot
+      # turn a collision into a silent skip.
+      mode:
+        required: false
+        type: string
+        default: publish
+      # The variants this run is to build, exactly as the plan named them: every
+      # variant the manifest declares for a `publish`, and for a `complete` only
+      # the ones the registry does not already serve at that revision. Both jobs
+      # gate on this list, so a completion never recompiles a variant whose exact
+      # name it is forbidden to rewrite -- and never leaves that rebuild's
+      # per-architecture digests in the registry with no tag that will ever point
+      # at them. Empty means "whatever the manifest declares", which is what a
+      # trial or a hand-dispatched run wants. This list only ever narrows
+      # BUILD_VARIANTS; a variant named here but not declared stays skipped by the
+      # manifest check, because the manifest is what says a series has a variant.
+      variants:
+        required: false
+        type: string
+        default: ""
+      # The git tag of the source being published (vMAJOR.MINOR.PATCH). A git
+      # tag marks a source release; it selects no PHP version and contributes
+      # nothing to an image name. release.yml's guard requires either the
+      # dispatched commit to carry one or the pushed ref to be one, and passes
+      # it here so the requirement is checked again at the point where a
+      # registry is written and recorded on the image as
+      # dev.php-legacy.source-release. Test-mode callers (build-and-verify.yml)
+      # have no release tag, and the label says "untagged" for them.
+      source_release:
+        required: false
+        type: string
+        default: ""
+      release:
+        required: false
+        type: boolean
+        default: false
+      push:
+        required: false
+        type: boolean
+        default: false
+      registry:
+        required: false
+        type: string
+        default: ghcr.io
+      namespace:
+        required: false
+        type: string
+        default: muffetlab
+      attestations:
+        required: false
+        type: boolean
+        default: true
+      # Trial knob: replaces the manifest's BASE_IMAGE for this build only. Set
+      # by build-and-verify.yml's trial dispatch, never by release.yml, and
+      # refused outright when push=true. The point is to answer "does this
+      # series build, pass its tests and carry fewer CVEs on a newer Debian?"
+      # without touching a reviewed pin -- the value still has to be
+      # digest-pinned, because an unpinned trial is a result nobody can
+      # reproduce.
+      base_image_override:
+        required: false
+        type: string
+        default: ""
+      # Optional uncompressed-MB budget shown in the size report. Reporting
+      # only: it never fails a build.
+      size_budget_mb:
+        required: false
+        type: string
+        default: ""
+    secrets:
+      token:
+        required: true
+      dockerhub_username:
+        required: false
+      dockerhub_token:
+        required: false
+
+jobs:
+  build:
+    # Both legs are pinned to one Ubuntu release: amd64 on ubuntu-24.04, arm64
+    # on ubuntu-24.04-arm. "ubuntu-latest" is deliberately not used -- GitHub
+    # began moving that label to Ubuntu 26.04 on 2026-10-19 (rolling out through
+    # 2026-11-19), so it would silently change the host OS, its apt packages
+    # (shellcheck runs in the validate gate) and its Docker engine between runs.
+    # Moving both labels to 26.04 is a reviewed change: run the validate gate
+    # and one build on ubuntu-26.04 first, and on the arm64 label for that
+    # release once GitHub publishes one. arm64 is a different, native
+    # GitHub-hosted runner: no QEMU, so the PHP compile costs what it costs on
+    # the architecture it targets.
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      packages: write
+      id-token: write # required for provenance/SBOM attestations
+    outputs:
+      # Matrix job outputs are last-writer-wins, so only values that every leg
+      # computes identically may be exported here: manifest readiness is
+      # variant-independent, and push mode depends only on the ref and caller.
+      ready: ${{ steps.state.outputs.ready }}
+      push: ${{ steps.pushmode.outputs.push }}
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [cli, fpm]
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve manifest state
+        id: state
+        env:
+          VERSION: ${{ inputs.version }}
+          VARIANT: ${{ matrix.variant }}
+          BASE_OVERRIDE: ${{ inputs.base_image_override }}
+          PUSH_INPUT: ${{ inputs.push }}
+          PLAN_VARIANTS: ${{ inputs.variants }}
+          REVISION: ${{ inputs.revision }}
+        run: |
+          set -eu
+          # Trusted project config, not untrusted input.
+          # shellcheck source=/dev/null
+          . "manifests/${VERSION}.env"
+          ready=1
+          for var in BASE_IMAGE SOURCE_REF PHP_SRC_COMMIT; do
+            eval "val=\${$var:-}"
+            case "$val" in ""|*REPLACE_WITH*) ready=0 ;; esac
+          done
+          # A "@sha256:" marker is not a pin: an unfilled manifest ships
+          # "@sha256:REPLACE_WITH_DIGEST", which the substring test above now
+          # catches. Be explicit anyway -- a hand-edited placeholder that only
+          # looks filled must skip, not start a doomed build.
+          case "${BASE_IMAGE:-}" in
+            *@sha256:*)
+              printf '%s' "${BASE_IMAGE##*@sha256:}" | grep -Eq '^[0-9a-f]{64}$' || ready=0
+              ;;
+            *) ready=0 ;;
+          esac
+          [ "${PATCHSET_APPROVED:-0}" = "1" ] || ready=0
+          declared=0
+          for v in ${BUILD_VARIANTS:-}; do
+            [ "$v" = "${VARIANT}" ] && declared=1
+          done
+          # The plan's list narrows the manifest's. A variant the plan did not
+          # name for this run is a variant the registry already serves at the
+          # revision being completed, so building it would compile an image the
+          # merge job is required to refuse and push digests no tag can reach.
+          # An empty list means the caller named nothing, which is every declared
+          # variant: a trial and a hand-dispatched build keep their behaviour.
+          selected=1
+          if [ -n "${PLAN_VARIANTS:-}" ]; then
+            selected=0
+            for v in ${PLAN_VARIANTS}; do
+              [ "$v" = "${VARIANT}" ] && selected=1
+            done
+          fi
+          # BUILD_PACKAGES / RUNTIME_PACKAGES are interpolated unquoted into
+          # apt-get inside the build, so restrict them to Debian package
+          # specifications (name[:arch][=version]) exactly like build.sh does.
+          pkg_re='^[A-Za-z0-9][A-Za-z0-9.+-]*(:[A-Za-z0-9.+-]+)?(=[A-Za-z0-9.+:~-]+)?$'
+          for list in BUILD_PACKAGES RUNTIME_PACKAGES; do
+            eval "val=\${$list:-}"
+            for tok in $val; do
+              if ! echo "$tok" | grep -Eq "$pkg_re"; then
+                echo "::error::${VERSION}: ${list} contains an invalid package specification: ${tok}"
+                ready=0
+              fi
+            done
+          done
+          # PHP_EXTENSIONS / PECL_EXTENSIONS are additions to the kit baseline,
+          # interpolated unquoted into the build's shell the same way, so they
+          # get the same treatment: shape here (an extension name is [a-z0-9_]),
+          # and which names this series can build at all is the Dockerfile's
+          # availability table, not a second copy of the answer here. Skipping
+          # rather than erroring keeps the parity with every other
+          # unready-manifest check in this step: the build job reports the
+          # refusal, this step just does not start a doomed build.
+          ext_re='^[a-z0-9_]+$'
+          for list in PHP_EXTENSIONS PECL_EXTENSIONS; do
+            eval "val=\${$list:-}"
+            for tok in $val; do
+              if ! echo "$tok" | grep -Eq "$ext_re"; then
+                echo "::error::${VERSION}: ${list} contains an invalid extension name: ${tok}"
+                ready=0
+              fi
+            done
+          done
+          # 1 = ship the configured source tree (official-image parity), 0 =
+          # omit it for image size. Anything else is a typo, not a choice.
+          case "${SHIP_PHP_SOURCE:-1}" in
+            0|1) ;;
+            *)
+              echo "::error::${VERSION}: SHIP_PHP_SOURCE must be 0 or 1 (got '${SHIP_PHP_SOURCE:-}')"
+              ready=0
+              ;;
+          esac
+          # Composer overrides are optional, but when present they must respect
+          # the version policy (Composer 2.x requires PHP >= 7.2.5).
+          cv="${COMPOSER_VERSION:-}"
+          cs="${COMPOSER_SHA256:-}"
+          case "${VERSION}" in
+            5.6|7.0|7.1) policy_cv="1.10.28" ;;
+            *)           policy_cv="2.11.0" ;;
+          esac
+          if [ -n "$cv" ]; then
+            if ! echo "$cv" | grep -Eq '^(1\.10|2)(\.[0-9]+)+$'; then
+              echo "::error::${VERSION}: COMPOSER_VERSION must be an exact 1.10.x or 2.x release (got ${cv})"
+              ready=0
+            fi
+            case "${VERSION}:${cv}" in
+              5.6:2.*|7.0:2.*|7.1:2.*)
+                echo "::error::${VERSION} cannot run Composer 2.x (requires PHP >= 7.2.5)"
+                ready=0
+                ;;
+            esac
+            if [ -z "$cs" ] && [ "$cv" != "$policy_cv" ]; then
+              echo "::warning::${VERSION}: COMPOSER_VERSION=${cv} differs from the policy pin ${policy_cv} and has no COMPOSER_SHA256; the phar digest will not be verified"
+            elif [ -n "$cs" ] && ! echo "$cs" | grep -Eq '^[0-9a-f]{64}$'; then
+              echo "::error::${VERSION}: COMPOSER_SHA256 must be a 64-character lowercase hex SHA-256"
+              ready=0
+            fi
+          fi
+          # --- trial base override -------------------------------------------
+          # base_image_override swaps only the OS base. Every PHP pin -- repo,
+          # commit, source ref, patchset approval -- still comes from the
+          # manifest, so a trial answers "does this series build and carry fewer
+          # CVEs on a newer Debian?" without producing a publishable image. The
+          # override is validated before the skip decision: a malformed trial
+          # base is an operator error and must not be reported as "manifest not
+          # ready".
+          effective_base="${BASE_IMAGE}"
+          if [ -n "${BASE_OVERRIDE:-}" ]; then
+            if [ "${PUSH_INPUT}" = "true" ]; then
+              echo "::error::base_image_override is a trial knob and may never be combined with push=true (a trial result is not a publishable image)"
+              exit 1
+            fi
+            # Same rule the manifest pins are held to: a digest, not a tag. An
+            # unpinned trial is a result nobody can reproduce, and the whole
+            # point of the knob is a comparable second data point.
+            case "${BASE_OVERRIDE}" in
+              *@sha256:*)
+                override_digest="${BASE_OVERRIDE##*@sha256:}"
+                ;;
+              *) override_digest="" ;;
+            esac
+            if ! printf '%s' "$override_digest" | grep -Eq '^[0-9a-f]{64}$'; then
+              echo "::error::base_image_override must be pinned by digest (repo[:tag]@sha256:<64 hex>). Resolve one with: ./tools/resolve-base-digest.sh --base debian:forky-slim"
+              exit 1
+            fi
+            echo "::warning::TRIAL BUILD ${VERSION}/${VARIANT}: base is ${BASE_OVERRIDE} instead of the reviewed ${BASE_IMAGE}. This image is never pushed; the trial result must be reviewed before any manifest pin changes."
+            effective_base="${BASE_OVERRIDE}"
+          fi
+          # Manifest-level readiness is variant-independent; export it for the
+          # merge job. (Per-leg skip is variant-dependent and must not be a job
+          # output: matrix outputs are last-writer-wins.)
+          if [ "$ready" = 1 ]; then echo "ready=yes" >> "$GITHUB_OUTPUT"; else echo "ready=no" >> "$GITHUB_OUTPUT"; fi
+          if [ "$ready" != 1 ] || [ "$declared" != 1 ] || [ "$selected" != 1 ]; then
+            echo "skip=yes" >> "$GITHUB_OUTPUT"
+            why=""
+            [ "$ready" = 1 ] || why="manifest not ready (unfilled pin or PATCHSET_APPROVED=0)"
+            [ "$declared" = 1 ] || why="${why:+${why}; }variant ${VARIANT} not in BUILD_VARIANTS"
+            [ "$selected" = 1 ] || why="${why:+${why}; }the plan did not name ${VARIANT} for this run -- at revision ${REVISION} that variant is the part of the release the registry already serves"
+            echo "::notice::${VERSION}/${VARIANT}: skipping - ${why}"
+          else
+            echo "skip=no" >> "$GITHUB_OUTPUT"
+            # Export resolved pins for later steps via the environment file
+            # (avoids interpolating manifest values into run scripts).
+            {
+              echo "M_BASE_IMAGE=${effective_base}"
+              echo "M_OPENSSL_ROUTE=${OPENSSL_ROUTE}"
+              echo "M_PHP_SRC_REPO=${PHP_SRC_REPO}"
+              echo "M_PHP_SRC_COMMIT=${PHP_SRC_COMMIT}"
+              echo "M_SOURCE_REF=${SOURCE_REF}"
+              echo "M_BUILD_PACKAGES=${BUILD_PACKAGES:-}"
+              echo "M_SHIP_PHP_SOURCE=${SHIP_PHP_SOURCE:-1}"
+              echo "M_RUNTIME_PACKAGES=${RUNTIME_PACKAGES:-}"
+              echo "M_PHP_EXTENSIONS=${PHP_EXTENSIONS:-}"
+              echo "M_PECL_EXTENSIONS=${PECL_EXTENSIONS:-}"
+              echo "M_COMPOSER_VERSION=${cv}"
+              echo "M_COMPOSER_SHA256=${cs}"
+              echo "M_PATCHSET_APPROVED=${PATCHSET_APPROVED}"
+            } >> "$GITHUB_ENV"
+          fi
+
+      # Push mode is allowed from two refs and no others: the default branch,
+      # which is where a workflow_dispatch of release.yml runs, and a conforming
+      # source release tag ref, which is where a tag push of release.yml runs. A
+      # pull request, a push to any branch, and a push of a tag whose name is
+      # not exactly vMAJOR.MINOR.PATCH can never publish, whatever the caller
+      # asked for. A push also requires source_release, the git tag of the
+      # source being published: tags mark source releases and select nothing
+      # else, so publishing from an untagged commit is refused here as well as
+      # by release.yml's guard, because this is the last check before an image
+      # leaves the building.
+      - name: Determine push mode
+        # Deliberately not gated on the manifest state: this value depends only
+        # on the ref and the caller, so every matrix leg computes the same
+        # answer and the job output the merge job reads is never racy.
+        id: pushmode
+        env:
+          SOURCE_RELEASE: ${{ inputs.source_release }}
+          PUSH: ${{ inputs.push }}
+          REVISION: ${{ inputs.revision }}
+          MODE: ${{ inputs.mode }}
+          REF: ${{ github.ref }}
+        run: |
+          set -eu
+          refkind=other
+          tagname=""
+          case "$REF" in
+            refs/heads/main | refs/heads/master) refkind=branch ;;
+            refs/tags/*)
+              refkind=tag
+              tagname="${REF#refs/tags/}"
+              ;;
+          esac
+          if [ "$PUSH" = "true" ]; then
+            # A publishing caller on a ref it may not publish from is a
+            # misconfiguration, not a skip: silently reporting push=false here
+            # would let every leg skip its by-digest push, skip the merge job,
+            # and still colour the release green having published nothing.
+            if [ "$refkind" = other ]; then
+              echo "::error::push=true but $REF may not publish (only refs/heads/main, refs/heads/master, or a vMAJOR.MINOR.PATCH tag -- from release.yml's dispatch on the default branch or its tag trigger)"
+              exit 1
+            fi
+            # The tag selects no PHP version and no image revision -- it says
+            # which commit of this repository is an official source release,
+            # which is what makes a published image traceable back to reviewable
+            # git history.
+            if ! printf '%s' "$SOURCE_RELEASE" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "::error::push=true but source_release='$SOURCE_RELEASE' is not a source release tag (expected vMAJOR.MINOR.PATCH); refusing to publish an image whose source commit is not a tagged release"
+              exit 1
+            fi
+            # On the tag entry the ref and the declared source are the same
+            # object, so a caller that published "from v1.0.0" while running on
+            # v2.0.0 is refused rather than believed. On the branch entry the
+            # source tag is read off the commit by release.yml's guard, so there
+            # is no ref name to agree with.
+            if [ "$refkind" = tag ] && [ "$tagname" != "$SOURCE_RELEASE" ]; then
+              echo "::error::push=true on tag $tagname but source_release says $SOURCE_RELEASE; a tag-triggered release publishes the source its own ref names"
+              exit 1
+            fi
+            # The verdict decides what an already-published exact name means, so
+            # a value outside the two it can take is refused here rather than
+            # read as one of them by whichever step happens to compare against
+            # it. An empty one is not a default: the input's default is publish,
+            # so an empty value means a caller composed the string itself.
+            if [ "$MODE" != publish ] && [ "$MODE" != complete ]; then
+              echo "::error::push=true but mode='$MODE' is not a release verdict (publish | complete). publish refuses a revision the registry has served; complete finishes one it has partly served -- see tools/release-plan.sh"
+              exit 1
+            fi
+            echo "Publishing from tagged source release $SOURCE_RELEASE ($refkind ref), verdict: $MODE"
+            # Every published exact name carries the revision, so a push with an
+            # empty or malformed one would produce a name no later build can
+            # reason about (and, in the old bare form, one a rebuild would
+            # overwrite). The number is derived from the registry by
+            # release.yml's plan step; this is where a caller that passed none
+            # at all is refused, because the input's empty default would
+            # otherwise compose "...-r--cli".
+            if ! printf '%s' "$REVISION" | grep -Eq '^[1-9][0-9]*$'; then
+              echo "::error::push=true but revision='$REVISION' is not an image revision (expected a positive integer such as 1; the published name is <php>-r<N>-<variant>). release.yml's plan step derives it from the exact names already in the registry -- see tools/release-plan.sh"
+              exit 1
+            fi
+            echo "push=true" >> "$GITHUB_OUTPUT"
+          else
+            # Test mode (build-and-verify.yml always calls this workflow without
+            # push): build and run every suite, publish nothing.
+            echo "push=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Docker Buildx
+        if: steps.state.outputs.skip == 'no'
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        if: steps.state.outputs.skip == 'no' && steps.pushmode.outputs.push == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.token }}
+
+      - name: Login to Docker Hub (optional mirror)
+        if: steps.state.outputs.skip == 'no' && steps.pushmode.outputs.push == 'true' && env.DOCKERHUB_USER != ''
+        uses: docker/login-action@v4
+        env:
+          DOCKERHUB_USER: ${{ secrets.dockerhub_username }}
+        with:
+          username: ${{ secrets.dockerhub_username }}
+          password: ${{ secrets.dockerhub_token }}
+
+      - name: Build image (gated, cached, load for tests)
+        if: steps.state.outputs.skip == 'no'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          pull: true
+          load: true
+          # A single native platform: load: true cannot load a manifest list,
+          # and testing the image on the architecture that built it is the
+          # point.
+          platforms: linux/${{ matrix.arch }}
+          cache-from: type=gha,scope=php-${{ inputs.version }}-${{ matrix.variant }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=php-${{ inputs.version }}-${{ matrix.variant }}-${{ matrix.arch }}
+          # Build-internal tag only (the same name build.sh uses locally) -- it
+          # is never pushed, and it deliberately does not look like a ref of the
+          # published image, which is <registry>/<namespace>/php; see the
+          # "Derive full PHP version and release tags" step.
+          tags: php-legacy-kit:${{ inputs.version }}-${{ matrix.variant }}-test
+          build-args: |
+            BASE_IMAGE=${{ env.M_BASE_IMAGE }}
+            PHP_VERSION=${{ inputs.version }}
+            PHP_VARIANT=${{ matrix.variant }}
+            PHP_SRC_REPO=${{ env.M_PHP_SRC_REPO }}
+            PHP_SRC_COMMIT=${{ env.M_PHP_SRC_COMMIT }}
+            OPENSSL_ROUTE=${{ env.M_OPENSSL_ROUTE }}
+            BUILD_PACKAGES=${{ env.M_BUILD_PACKAGES }}
+            SHIP_PHP_SOURCE=${{ env.M_SHIP_PHP_SOURCE }}
+            RUNTIME_PACKAGES=${{ env.M_RUNTIME_PACKAGES }}
+            PATCHSET_APPROVED=${{ env.M_PATCHSET_APPROVED }}
+            BUILD_SOURCE_REF=${{ env.M_SOURCE_REF }}
+            COMPOSER_VERSION=${{ env.M_COMPOSER_VERSION }}
+            COMPOSER_SHA256=${{ env.M_COMPOSER_SHA256 }}
+            PHP_EXTENSIONS=${{ env.M_PHP_EXTENSIONS }}
+            PECL_EXTENSIONS=${{ env.M_PECL_EXTENSIONS }}
+
+      - name: Smoke tests
+        if: steps.state.outputs.skip == 'no'
+        env:
+          IMAGE: php-legacy-kit:${{ inputs.version }}-${{ matrix.variant }}-test
+          ROUTE: ${{ env.M_OPENSSL_ROUTE }}
+          VARIANT: ${{ matrix.variant }}
+        run: ./tests/smoke.sh "$IMAGE" "$ROUTE" "$VARIANT"
+
+      - name: Extension tests
+        if: steps.state.outputs.skip == 'no'
+        env:
+          IMAGE: php-legacy-kit:${{ inputs.version }}-${{ matrix.variant }}-test
+          ROUTE: ${{ env.M_OPENSSL_ROUTE }}
+        run: ./tests/extensions.sh "$IMAGE" "$ROUTE"
+
+      - name: Composer tests
+        if: steps.state.outputs.skip == 'no'
+        run: ./tests/composer.sh "php-legacy-kit:${{ inputs.version }}-${{ matrix.variant }}-test"
+
+      # --- OS layer: currency and CVE gate -----------------------------------
+      # The PHP source is a reviewed pin; the operating system under it is a
+      # Debian package set, and that set is only knowable from the artifact. So
+      # this gate reads /opt/php/RUNTIME-OS-PACKAGES out of the image the build
+      # just produced (the same inventory tools/verify-runtime.sh re-checks) and
+      # asks the image's own suite what it offers today, instead of trusting a
+      # manifest list that describes the base digest rather than the built
+      # image.
+      #
+      # What it fails on is deliberately narrow: a scanner finding whose fix
+      # Debian publishes for *this* suite, and which the image does not already
+      # carry -- a fix this kit could have taken and did not. A finding with no
+      # candidate in the suite is not a defect, it is a row in
+      # manifests/OS-CVE-STATUS.md, and the row's evidence plus review date is
+      # what turns "we knew" into something a stranger can check. There is no
+      # ignore list, so a new CVE cannot be silenced by editing a config file --
+      # only by writing a register row, in the open, with a reason that survives
+      # contact with the Debian tracker. A register row that cites a version the
+      # image no longer contains fails as stale for the same reason.
+      #
+      # Both steps run before any push: a leg that cannot say which OS packages
+      # it ships does not publish them.
+      - name: Install the pinned trivy (OS CVE gate)
+        if: steps.state.outputs.skip == 'no'
+        # The four SHA-256 digests in tools/install-trivy.sh are filled (checked
+        # against upstream's own checksums file and against the downloaded
+        # assets). While they were empty this step only warned, scan-image.sh
+        # found no scanner, classified nothing, and reported `clean` -- four
+        # green legs per run, having scanned nothing. The tolerance is gone at
+        # the gate: an unfilled pin still just warns here (the value is a
+        # human's to commit), but the verdict is then `unverified` and the leg
+        # fails, because an image nobody scanned is not an image that is free of
+        # CVEs. A *filled* pin that does not match the download fails here: that
+        # is upstream rotating the asset or the download arriving from somewhere
+        # else, which is not a thing to build on top of.
+        #
+        # jq is fetched in the same step because scan-image.sh needs it to read
+        # the report. The version is printed before the gate runs, and if jq is
+        # somehow still absent the gate exits 2 naming it, rather than guessing.
+        run: |
+          command -v jq >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq jq; }
+          jq --version
+          ./tools/install-trivy.sh
+
+      - name: OS package currency and CVE gate
+        if: steps.state.outputs.skip == 'no'
+        env:
+          IMAGE: php-legacy-kit:${{ inputs.version }}-${{ matrix.variant }}-test
+        run: |
+          set -eu
+          ./tools/scan-image.sh "$IMAGE" \
+            --json-out "os-cve-${{ inputs.version }}-${{ matrix.variant }}-${{ matrix.arch }}.json"
+
+      # Uploaded with always() because the report is most useful on the leg that
+      # failed: the JSON names each finding, its classification and the register
+      # row (or the absence of one) behind the verdict.
+      - name: Upload the OS CVE report
+        if: steps.state.outputs.skip == 'no' && always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: os-cve-${{ inputs.version }}-${{ matrix.variant }}-${{ matrix.arch }}
+          path: os-cve-${{ inputs.version }}-${{ matrix.variant }}-${{ matrix.arch }}.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      # Reporting only, never gating: the numbers are what a reviewer needs to
+      # decide whether SHIP_PHP_SOURCE=0 or a tighter RUNTIME_PACKAGES list is
+      # worth it for this series. BUDGET_MB is a threshold for the log line, not
+      # a pass/fail, because the right budget depends on the base image chosen.
+      - name: Report image size
+        if: steps.state.outputs.skip == 'no'
+        continue-on-error: true
+        env:
+          IMAGE: php-legacy-kit:${{ inputs.version }}-${{ matrix.variant }}-test
+          LABEL: ${{ inputs.version }}-${{ matrix.variant }}-${{ matrix.arch }}-${{ env.M_OPENSSL_ROUTE }} (SHIP_PHP_SOURCE=${{ env.M_SHIP_PHP_SOURCE }})
+          BUDGET_MB: ${{ inputs.size_budget_mb }}
+        run: ./tools/report-image-size.sh "$IMAGE" "$LABEL"
+
+      - name: Resolve full PHP version
+        id: full
+        if: steps.state.outputs.skip == 'no'
+        env:
+          IMAGE: php-legacy-kit:${{ inputs.version }}-${{ matrix.variant }}-test
+        run: |
+          set -eu
+          full="$(docker run --rm --entrypoint /opt/php/bin/php "$IMAGE" -r 'echo PHP_VERSION;')"
+          [ -n "$full" ] || { echo "::error::could not read PHP_VERSION from the image"; exit 1; }
+          echo "full=$full" >> "$GITHUB_OUTPUT"
+
+      # A publish verdict is a promise about the registry: the plan read it and
+      # found nothing at this revision. When the exact name is nevertheless
+      # already served there, the merge job refuses to rewrite it -- but by then
+      # this leg has pushed its per-architecture manifests, and their attestation
+      # children, for that name to be refused. Those are digests no tag will ever
+      # reach, which is exactly what the registry's Versions tab lists as untagged.
+      # Asking the question once here, before the push, is what stops the flow
+      # paying that cost for a publish it was never allowed to make.
+      #
+      # This step is after the build on purpose: the name asked about is the one
+      # this leg would have written, read from the image itself, not one rederived
+      # from the manifest and possibly drifted from it.
+      #
+      # A completion leg is not asked. There the plan read the registry, found
+      # this revision partly served, and sent this leg to finish it, so an
+      # existing name is the expected answer for the variants the plan left out --
+      # and the ones it handed over are the merge job's business; see inputs.mode.
+      - name: Refuse to push into an already published name
+        if: steps.state.outputs.skip == 'no' && steps.pushmode.outputs.push == 'true' && inputs.mode == 'publish'
+        env:
+          REGISTRY: ${{ inputs.registry }}
+          NAMESPACE: ${{ inputs.namespace }}
+          VARIANT: ${{ matrix.variant }}
+          REVISION: ${{ inputs.revision }}
+          FULL: ${{ steps.full.outputs.full }}
+        run: |
+          set -eu
+          repo="${REGISTRY}/${NAMESPACE}/php"
+          exact="${FULL}-r${REVISION}-${VARIANT}"
+          if existing="$(docker buildx imagetools inspect "${repo}:${exact}" 2>&1)"; then
+            printf '%s\n' "$existing" | sed -n '1,4p'
+            echo "::error::${repo}:${exact} is already published, and an exact published name is never rewritten. This leg holds a publish verdict, which promised a revision the registry does not serve, so either the registry moved under the run or the verdict arrived wrong -- and nothing here can be pushed to make either true. Failing before the push is the point: the registry gains no untagged digest from a release it refused"
+            exit 1
+          fi
+          # A read that did not answer with a manifest is not a verdict about the
+          # name, so it is not treated as one either: the leg continues and the
+          # merge job keeps the post-push refusal as the backstop. Classifying the
+          # error text instead would make a transient registry failure cancel a
+          # release.
+          printf '%s\n' "$existing" | sed -n '1p'
+          echo "the registry did not answer for ${repo}:${exact}; this leg may push, and the merge job asks again before it writes tags"
+
+      # Digest only: no tag may point at a single architecture. The merge job
+      # below turns the per-arch digests into the manifest list behind every
+      # published tag. The image pushed here is the one whose layers the tests
+      # above exercised; BUILD_MODE/GIT_REVISION only change OCI labels.
+      #
+      # `push=true` inside the output spec is the whole step. `type=image`
+      # without it is buildx's *local-load* exporter: it builds the image,
+      # writes an attestation index for it, prints a digest, exits 0 and puts
+      # nothing in the registry -- a leg that looks green and publishes nothing.
+      # The first v7.4.33 release run did exactly that: four green legs, four
+      # digests, and a registry that did not serve any of the manifests those
+      # digests named -- the only visible symptom was both merge jobs dying on
+      # "ghcr.io/.../php@sha256:cb0cab7f...: not found". Measured against a
+      # local registry:2 with the same output spec: without push=true the
+      # repository gets no manifest revisions at all; with it the digest the
+      # action reports is one of them. So the output spec carries push=true here
+      # and the step after it asks the registry for that exact manifest, which
+      # turns the same mistake into a leg that fails in seconds instead of a
+      # release that fails twenty minutes later with an unreadable ref.
+      - name: Push per-architecture image by digest
+        id: pushdigest
+        if: steps.state.outputs.skip == 'no' && steps.pushmode.outputs.push == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          pull: true
+          platforms: linux/${{ matrix.arch }}
+          cache-from: type=gha,scope=php-${{ inputs.version }}-${{ matrix.variant }}-${{ matrix.arch }}
+          outputs: type=image,name=${{ inputs.registry }}/${{ inputs.namespace }}/php,push=true,push-by-digest=true,name-canonical=true
+          labels: |
+            org.opencontainers.image.title=${{ inputs.namespace }}/php ${{ steps.full.outputs.full }} ${{ matrix.variant }}
+            org.opencontainers.image.version=${{ steps.full.outputs.full }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.url=${{ github.server_url }}/${{ github.repository }}/blob/${{ github.event.repository.default_branch || 'master' }}/SUPPORTED.md
+            dev.php-legacy.variant=${{ matrix.variant }}
+            dev.php-legacy.openssl-route=${{ env.M_OPENSSL_ROUTE }}
+            dev.php-legacy.source-commit=${{ env.M_PHP_SRC_COMMIT }}
+            dev.php-legacy.base-image=${{ env.M_BASE_IMAGE }}
+            dev.php-legacy.source-release=${{ inputs.source_release || 'untagged' }}
+            # A test build has no published name, so it has no revision either:
+            # saying "r1" on an image nobody can pull would be a claim about an
+            # address that does not exist. Only a publishing run labels a
+            # revision.
+            dev.php-legacy.image-revision=${{ inputs.push && format('r{0}', inputs.revision) || 'unpublished' }}
+          provenance: ${{ inputs.attestations }}
+          sbom: ${{ inputs.attestations }}
+          build-args: |
+            BASE_IMAGE=${{ env.M_BASE_IMAGE }}
+            PHP_VERSION=${{ inputs.version }}
+            PHP_VARIANT=${{ matrix.variant }}
+            PHP_SRC_REPO=${{ env.M_PHP_SRC_REPO }}
+            PHP_SRC_COMMIT=${{ env.M_PHP_SRC_COMMIT }}
+            OPENSSL_ROUTE=${{ env.M_OPENSSL_ROUTE }}
+            BUILD_PACKAGES=${{ env.M_BUILD_PACKAGES }}
+            SHIP_PHP_SOURCE=${{ env.M_SHIP_PHP_SOURCE }}
+            RUNTIME_PACKAGES=${{ env.M_RUNTIME_PACKAGES }}
+            PATCHSET_APPROVED=${{ env.M_PATCHSET_APPROVED }}
+            BUILD_SOURCE_REF=${{ env.M_SOURCE_REF }}
+            COMPOSER_VERSION=${{ env.M_COMPOSER_VERSION }}
+            COMPOSER_SHA256=${{ env.M_COMPOSER_SHA256 }}
+            PHP_EXTENSIONS=${{ env.M_PHP_EXTENSIONS }}
+            PECL_EXTENSIONS=${{ env.M_PECL_EXTENSIONS }}
+            BUILD_MODE=ci
+            GIT_REVISION=${{ github.sha }}
+
+      - name: Export digest
+        if: steps.state.outputs.skip == 'no' && steps.pushmode.outputs.push == 'true'
+        env:
+          ARCH: ${{ matrix.arch }}
+          VARIANT: ${{ matrix.variant }}
+          REPO: ${{ inputs.registry }}/${{ inputs.namespace }}/php
+          ACTION_DIGEST: ${{ steps.pushdigest.outputs.digest }}
+          FULL_VERSION: ${{ steps.full.outputs.full }}
+        run: |
+          set -eu
+          # The action's `digest` output is buildx's `containerimage.digest`:
+          # the digest of what it PUT at the canonical name. With
+          # provenance/SBOM on that is the attestation *index* over the image
+          # manifest, with them off it is the image manifest; both are what
+          # `imagetools create` needs, and measured locally
+          # `containerimage.descriptor` agrees with it, so there is nothing to
+          # second-guess here. What it does not prove is that the push happened
+          # -- which is why the registry is asked, right below.
+          pushed="${ACTION_DIGEST}"
+          if ! printf '%s' "$pushed" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::the push step reported no usable digest for ${VARIANT}/${ARCH} (got '${pushed}'), so the merge job would be handed a reference that cannot exist"
+            exit 1
+          fi
+          # Ask the registry for exactly this manifest. This is the check that
+          # would have caught the v7.4.33 run at the leg instead of at the
+          # merge.
+          if ! raw="$(docker buildx imagetools inspect --raw "${REPO}@${pushed}" 2>&1)"; then
+            printf '%s\n' "$raw"
+            echo "::error::${REPO}@${pushed} is not served by the registry: this leg built an image but published nothing (a type=image output without push=true loads locally and exits 0). Refusing to record a digest the merge job cannot resolve."
+            exit 1
+          fi
+          media="$(printf '%s\n' "$raw" | awk -F'"' '/mediaType/{print $4; exit}')"
+          mkdir -p "${RUNNER_TEMP}/digests"
+          echo "$pushed" > "${RUNNER_TEMP}/digests/${ARCH}.digest"
+          # Identical on both legs; the merge job needs it for tag names.
+          echo "${FULL_VERSION}" > "${RUNNER_TEMP}/digests/full.version"
+          echo "Registry serves ${REPO}@${pushed} as ${media:-an untyped manifest}; recorded ${ARCH} digest for ${VARIANT}"
+
+      - name: Upload digest
+        if: steps.state.outputs.skip == 'no' && steps.pushmode.outputs.push == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ inputs.version }}-${{ matrix.variant }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Export image tarball
+        if: steps.state.outputs.skip == 'no' && inputs.release && steps.pushmode.outputs.push != 'true'
+        run: |
+          set -eu
+          out="php-legacy-kit-${{ inputs.version }}-${{ matrix.variant }}-${{ matrix.arch }}.tar.gz"
+          docker save "php-legacy-kit:${{ inputs.version }}-${{ matrix.variant }}-test" | gzip > "$out"
+          # The artifact is what a reviewer downloads; the uncompressed number
+          # is in the size report above, this one says what the build weighs on
+          # disk.
+          echo "Compressed tarball: $(du -h "$out" | cut -f1) (uncompressed image size is in the size report step)"
+
+      - name: Upload artifact
+        if: steps.state.outputs.skip == 'no' && inputs.release && steps.pushmode.outputs.push != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: php-legacy-kit-${{ inputs.version }}-${{ matrix.variant }}-${{ matrix.arch }}
+          path: php-legacy-kit-${{ inputs.version }}-${{ matrix.variant }}-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  # --- Assemble the multi-arch manifest list ---------------------------------
+  # Runs only in push mode and only for a release-ready manifest. Each variant
+  # merges the linux/amd64 and linux/arm64 digests built above; both legs must
+  # have finished (and passed their tests) before this runs, and a failure in
+  # either leg means no published tag is created at all. Per-platform
+  # provenance/SBOM attestation manifests are carried into the list by
+  # imagetools, which merges the children of each index it is given.
+  merge:
+    needs: build
+    if: needs.build.outputs.ready == 'yes' && needs.build.outputs.push == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [cli, fpm]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Is this variant declared for the version
+        id: declared
+        env:
+          VERSION: ${{ inputs.version }}
+          VARIANT: ${{ matrix.variant }}
+          PLAN_VARIANTS: ${{ inputs.variants }}
+        run: |
+          set -eu
+          # Trusted project config, not untrusted input.
+          # shellcheck source=/dev/null
+          . "manifests/${VERSION}.env"
+          declared=no
+          for v in ${BUILD_VARIANTS:-}; do
+            [ "$v" = "$VARIANT" ] && declared=yes
+          done
+          # The same list the build leg gated on, for the same reason: a variant
+          # the plan did not name built nothing and uploaded no digests, so a
+          # merge job that ran for it would download an artifact that is not
+          # there and then try to publish a manifest list from nothing. Reading
+          # the narrowing twice -- once per job -- is what keeps the two jobs
+          # from disagreeing about which half of a completion this run is.
+          if [ "$declared" = yes ] && [ -n "${PLAN_VARIANTS:-}" ]; then
+            declared=no
+            for v in ${PLAN_VARIANTS}; do
+              [ "$v" = "$VARIANT" ] && declared=yes
+            done
+          fi
+          echo "declared=${declared}" >> "$GITHUB_OUTPUT"
+
+      - name: Download per-architecture digests
+        if: steps.declared.outputs.declared == 'yes'
+        uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-${{ inputs.version }}-${{ matrix.variant }}-*
+          merge-multiple: true
+
+      - name: Login to GHCR
+        if: steps.declared.outputs.declared == 'yes'
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.token }}
+
+      - name: Login to Docker Hub (optional mirror)
+        if: steps.declared.outputs.declared == 'yes' && env.DOCKERHUB_USER != ''
+        env:
+          DOCKERHUB_USER: ${{ secrets.dockerhub_username }}
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.dockerhub_username }}
+          password: ${{ secrets.dockerhub_token }}
+
+      - name: Create manifest list and publish tags
+        if: steps.declared.outputs.declared == 'yes'
+        env:
+          REGISTRY: ${{ inputs.registry }}
+          NAMESPACE: ${{ inputs.namespace }}
+          VERSION: ${{ inputs.version }}
+          VARIANT: ${{ matrix.variant }}
+          REVISION: ${{ inputs.revision }}
+          MODE: ${{ inputs.mode }}
+          DOCKERHUB_USER: ${{ secrets.dockerhub_username }}
+        run: |
+          set -eu
+          cd "${RUNNER_TEMP}/digests"
+          repo="${REGISTRY}/${NAMESPACE}/php"
+          [ -s full.version ] || { echo "::error::full.version missing from the digest artifacts"; exit 1; }
+          full="$(cat full.version)"
+          [ -n "$full" ] || { echo "::error::full.version is empty"; exit 1; }
+          # The revision becomes part of a published name, so it is checked here
+          # as well as in the push-mode guard above: a plain positive integer,
+          # because a caller that passed "1 " or "-1" would publish a tag nobody
+          # can name afterwards -- and every published name carries one, so
+          # empty is refused too rather than silently producing a bare
+          # <full>-<variant> name.
+          if ! printf '%s' "$REVISION" | grep -Eq '^[1-9][0-9]*$'; then
+            echo "::error::revision '$REVISION' is not an image revision (positive integer without leading zeros); the published name would be <${full}-r?>-${VARIANT}"
+            exit 1
+          fi
+          # Exactly the platforms this workflow promises. A missing digest is a
+          # partial release, and a partial release must not publish a tag.
+          refs=""
+          for arch in amd64 arm64; do
+            [ -s "${arch}.digest" ] || { echo "::error::no ${arch} image digest was uploaded"; exit 1; }
+            refs="${refs} ${repo}@$(cat "${arch}.digest")"
+          done
+          # The published address is spelled out here, literally, because
+          # tools/check-image-name.sh reads it back out of this workflow and
+          # holds the docs to it.
+          repos="${REGISTRY}/${NAMESPACE}/php"
+          primary_repo="${REGISTRY}/${NAMESPACE}/php"
+          if [ -n "${DOCKERHUB_USER}" ]; then repos="${repos} ${DOCKERHUB_USER}/php"; fi
+          # There is deliberately no tag-derived check left in this step: a git
+          # tag marks the source release and says nothing about which PHP series
+          # this build is, so the series can only come from inputs.version,
+          # which release.yml fills from its own validated selection. What is
+          # checked here instead is that the run is a publishing run at all --
+          # the push-mode guard above refuses a push from any ref but the
+          # default branch and from a commit that carries no source release tag.
+          # The builder is only used to talk to the registry here, but its
+          # version and driver are the first things to suspect when a publish
+          # fails, so the step records them.
+          docker buildx version
+          publish_one() { # <registry/repo> <primary|mirror> -- one list per registry
+            local repo="$1" role="$2" tags="" out exact taken copied_from
+            # Fully-qualified tag: the exact PHP version from the manifest's
+            # SOURCE_REF (via the built image's own version), then this run's
+            # image revision, then the variant. 8.1.34-r1-cli is that build
+            # forever; the next fix -- an OS refresh that leaves the PHP pin
+            # alone, or a newer backports commit -- is published beside it as
+            # 8.1.34-r2-cli. The name is a snapshot, which is the whole point of
+            # the revision, so the route it was built with is fixed by the
+            # digest behind it. The route is still not in the name; read it from
+            # BUILD-PROVENANCE or the OCI label if it matters.
+            exact="${full}-r${REVISION}-${VARIANT}"
+            # An exact name is written once, so ask the registry whether this very
+            # name is already taken before asking it to take it. What a "yes" means
+            # depends on the verdict this leg was handed and on which registry is
+            # answering, and the three cases are not variations of one another:
+            #   primary + publish -- the plan read THIS registry and proposed a
+            #     revision it found nothing at, so a name here is the registry having
+            #     moved under the run. Refusing is what keeps one revision number
+            #     meaning one reviewed build: publishing this series' other variant
+            #     beside that name would put two pinsets under one r<N>.
+            #   primary + complete -- the plan read THIS registry, found this variant
+            #     already current at this revision and sent the series to be finished
+            #     at it. So this name is not a collision, it is this release being
+            #     already published: the snapshot is left exactly as it is and the
+            #     floating name is re-pointed at it, which costs nothing and restores
+            #     the one invariant a revision has (<minor>-<variant> is the newest
+            #     revisioned build). What is NOT done is writing this leg's freshly
+            #     built digests under that name -- a PHP compile is not reproducible,
+            #     so a retry's digests differ from the published ones even when its
+            #     pins do not, and the published ones are the release.
+            #   mirror, name taken -- the plan never reads the mirror, so a name
+            #     there can only be the residue of a run that published to the
+            #     primary registry and failed here. Skipping the registry that
+            #     already has it, and publishing the ones that do not, is what lets a
+            #     retry finish a release instead of being refused by the half that
+            #     succeeded. The mirror's own floating name was written by the same
+            #     call as its snapshot, so there is nothing here to restore.
+            #   mirror, name free but the primary serves it -- this is not this
+            #     run's build to make. The copy branch below takes the primary's
+            #     name as it stands, so the mirror never comes to hold a different
+            #     image under a snapshot the primary already published.
+            if taken="$(docker buildx imagetools inspect "${repo}:${exact}" 2>&1)"; then
+              printf '%s\n' "$taken" | sed -n '1,4p'
+              if [ "$role" = mirror ]; then
+                echo "Skipped ${repo}:${exact}: the mirror already serves this snapshot, so this registry has nothing to publish. Continuing with the registries that do."
+                return 0
+              fi
+              if [ "$MODE" = complete ]; then
+                if ! out="$(docker buildx imagetools create -t "${repo}:${VERSION}-${VARIANT}" "${repo}:${exact}" 2>&1)"; then
+                  printf '%s\n' "$out"
+                  echo "::error::could not re-point ${repo}:${VERSION}-${VARIANT} at the already-published ${repo}:${exact}: $(printf '%s\n' "$out" | tail -n 3 | tr '\n' ' ')"
+                  return 1
+                fi
+                echo "Reused ${repo}:${exact} as published (an exact name is never rewritten) and re-pointed ${repo}:${VERSION}-${VARIANT} at it -- this leg completed the revision instead of adding to it"
+                return 0
+              fi
+              echo "::error::${repo}:${exact} already exists, and an exact published name is never rewritten. This leg was handed a publish verdict, which promised a revision the registry does not serve, so either the registry moved under the run or the verdict arrived wrong -- and re-running this leg cannot fix either, because the same name is still there. The next release run reads the registry and either moves to the next revision or completes what is already served"
+              return 1
+            fi
+            tags="-t ${repo}:${exact}"
+            # A mirror is a copy, and it is a copy of the primary registry
+            # rather than a second place that builds the same thing. So before
+            # this registry takes this run's freshly built digests under a name,
+            # ask the primary whether it already serves that name -- because
+            # when it does, those digests are the release, and a PHP compile is
+            # not reproducible: this run's amd64 layer differs from the
+            # published one even when every pin matches, and writing it here
+            # would give one exact name two contents, which is the thing the
+            # revision exists to prevent. imagetools create between registries
+            # moves the manifests and blobs as they are, so the mirror ends up
+            # byte-identical to the primary without building anything again --
+            # and the floating name moves to the same image on both.
+            if [ "$role" = mirror ] &&
+              copied_from="$(docker buildx imagetools inspect "${primary_repo}:${exact}" 2>&1)"; then
+              printf '%s\n' "$copied_from" | sed -n '1,4p'
+              if ! out="$(docker buildx imagetools create -t "${repo}:${exact}" \
+                -t "${repo}:${VERSION}-${VARIANT}" "${primary_repo}:${exact}" 2>&1)"; then
+                printf '%s\n' "$out"
+                echo "::error::could not copy ${primary_repo}:${exact} to ${repo}:${exact}: $(printf '%s\n' "$out" | tail -n 3 | tr '\n' ' ')"
+                return 1
+              fi
+              echo "Copied ${primary_repo}:${exact} to ${repo}:${exact} and pointed ${repo}:${VERSION}-${VARIANT} at it -- the primary already served this snapshot, so the mirror took it from there instead of from this run's digests"
+              return 0
+            fi
+            # Floating convenience tag for the minor series. It is the only
+            # moving name this pipeline writes, it always moves to the build
+            # published here, and by construction it cannot change the major
+            # version. There is no :latest-<variant> and no plain :latest.
+            tags="${tags} -t ${repo}:${VERSION}-${VARIANT}"
+            # shellcheck disable=SC2086  # word-splitting the tag/ref lists is the point
+            if ! out="$(docker buildx imagetools create ${tags} ${refs} 2>&1)"; then
+              printf '%s\n' "$out"
+              # Publishing logs get truncated in the Actions UI, but an
+              # annotation is shown even then -- and naming the repository that
+              # failed is what separates "GHCR refused us" from "the Docker Hub
+              # mirror refused us".
+              echo "::error::imagetools create failed for ${repo}: $(printf '%s\n' "$out" | tail -n 3 | tr '\n' ' ')"
+              return 1
+            fi
+            printf '%s\n' "$out"
+            echo "Published ${repo}:${exact} (snapshot) and ${repo}:${VERSION}-${VARIANT} (floating) from:${refs}"
+          }
+          # One imagetools call per registry, primary first: a single call
+          # carrying both registries loses the GHCR tags if the mirror refuses,
+          # and its error cannot say which registry is at fault. The mirror
+          # still fails the job -- half a release is not a release -- but only
+          # after GHCR is published. The role travels with it because "this name
+          # already exists" is a refusal on the registry the plan read and a
+          # skip on one it did not.
+          for r in $repos; do
+            if [ "$r" = "${REGISTRY}/${NAMESPACE}/php" ]; then role=primary; else role=mirror; fi
+            publish_one "$r" "$role"
+          done
+
+      - name: Verify the manifest list covers both architectures
+        if: steps.declared.outputs.declared == 'yes'
+        env:
+          REGISTRY: ${{ inputs.registry }}
+          NAMESPACE: ${{ inputs.namespace }}
+          VERSION: ${{ inputs.version }}
+          VARIANT: ${{ matrix.variant }}
+          REVISION: ${{ inputs.revision }}
+        run: |
+          set -eu
+          cd "${RUNNER_TEMP}/digests"
+          full="$(cat full.version)"
+          exact="${full}-r${REVISION}-${VARIANT}"
+          # Both names this run writes are read back, for both platforms. The
+          # floating one because it is what deployments track, and the exact one
+          # because it is now a snapshot: nothing later will correct a bad
+          # 8.1.34-r1-cli, so a list that published short has to be said here.
+          for ref in "${REGISTRY}/${NAMESPACE}/php:${VERSION}-${VARIANT}" \
+                     "${REGISTRY}/${NAMESPACE}/php:${exact}"; do
+            out="$(docker buildx imagetools inspect "$ref")"
+            printf '%s\n' "$out"
+            for p in linux/amd64 linux/arm64; do
+              printf '%s\n' "$out" | grep -Eq "Platform: *${p}([[:space:],]|$)" \
+                || { echo "::error::${ref} manifest list does not contain ${p}"; exit 1; }
+            done
+          done
+
+      # Reporting only. `imagetools create` merges the children of each index it
+      # is given, so the per-arch provenance/SBOM attestation manifests ride
+      # into the published list -- the first published image proves it (7.4-cli,
+      # run 41288106152: every linux/amd64 and linux/arm64 entry is followed by
+      # an attestation manifest carrying an SPDX SBOM and an SLSA provenance v1
+      # statement). Counting them here is what turns "the registry supports
+      # attestations" from an assumption into a line in the release log.
+      #
+      # The counter has to follow the format buildx actually writes.
+      # Attestations go out in the *docker* format: the index child is an OCI
+      # manifest annotated `vnd.docker.reference.type: attestation-manifest`
+      # whose **layers** are the `application/vnd.in-toto+json` statements. The
+      # in-toto media type never appears in the index itself, so a first version
+      # of this step that grepped for it reported zero attestations on an image
+      # that had two -- a false alarm about a missing audit trail is worse than
+      # no report, because people stop reading the reports. Both formats are
+      # counted; absent attestations with attestations=true stays a warning, not
+      # a failure, since the tags and layers a consumer pulls are already
+      # correct.
+      - name: Report what the manifest list carries
+        if: steps.declared.outputs.declared == 'yes'
+        continue-on-error: true
+        env:
+          REGISTRY: ${{ inputs.registry }}
+          NAMESPACE: ${{ inputs.namespace }}
+          VERSION: ${{ inputs.version }}
+          VARIANT: ${{ matrix.variant }}
+          ATTEST: ${{ inputs.attestations }}
+        run: |
+          set -eu
+          ref="${REGISTRY}/${NAMESPACE}/php:${VERSION}-${VARIANT}"
+          raw="$(docker buildx imagetools inspect --raw "$ref")"
+          # Occurrences, not lines: today inspect --raw pretty-prints one key
+          # per line, and a compact index would make a line count read 1 for
+          # ten.
+          n_docker="$(printf '%s\n' "$raw" | grep -o 'attestation-manifest' | wc -l | tr -d ' ' || true)"
+          n_intoto="$(printf '%s\n' "$raw" | grep -o 'application/vnd.in-toto+json' | wc -l | tr -d ' ' || true)"
+          n_att=$((n_docker + n_intoto))
+          # Real platforms only: an attestation entry sits in the list as
+          # unknown/unknown, so the text form's linux/ lines are the count.
+          n_plat="$(docker buildx imagetools inspect "$ref" | grep -c 'Platform: *linux/' || true)"
+          echo "${ref}: ${n_plat} linux platform entries, ${n_att} attestation manifests (attestations=${ATTEST})"
+          if [ "$ATTEST" != "false" ] && [ "$n_att" -eq 0 ]; then
+            echo "::warning::attestations were requested but ${ref} carries none; the images are published, the audit trail is the BUILD-PROVENANCE label and this run's logs"
+          fi
+
+      # The Docker Hub mirror's Overview is *not* synced here, on purpose. It is
+      # one piece of metadata for the whole <user>/php repository, not one per
+      # series or per variant, and this job runs once per selected series in a
+      # release -- so a version=all release would otherwise PATCH the same
+      # document eight times from eight legs that cannot see each other.
+      # release.yml does it once, in its own job, after the matrix has
+      # published. A caller that forgets that job gets no Overview write at all,
+      # which is visible; a caller that leaves the sync here gets eight, which
+      # is not.
+      - name: Note that the mirror Overview is synced elsewhere
+        if: steps.declared.outputs.declared == 'yes' && matrix.variant == 'cli'
+        run: |
+          echo "This leg published images only. The Docker Hub mirror's Overview is one document for the whole repository and is synced once per release run by release.yml's mirror-readme job; .github/workflows/sync-dockerhub-readme.yml does it on its own for a README-only change."
+

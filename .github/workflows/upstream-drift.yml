@@ -1,0 +1,122 @@
+name: upstream-drift
+
+# Read-only upstream freshness check. It never builds or pushes an image and
+# never edits a manifest. Both tools are advisory and exit successfully when
+# they find drift, so only their explicit drift lines open the report Issue.
+# Placeholder pins and unreachable upstreams do not count as drift. A clean run
+# does not close an existing Issue either: a human decides when the new pins
+# have been reviewed and adopted, and a network failure must not read as a fix.
+
+on:
+  schedule:
+    # Every second day at 02:17 UTC (10:17 in Asia/Shanghai).
+    - cron: "17 2 */2 * *"
+  workflow_dispatch:
+
+concurrency:
+  group: upstream-drift
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        # Base digests are resolved through imagetools inspect; no image is
+        # pulled and no registry login is needed.
+        uses: docker/setup-buildx-action@v4
+
+      - name: Check upstream source and base pins
+        run: |
+          set -Eeuo pipefail
+          ./tools/check-pin-drift.sh --quiet 2>&1 | tee "$RUNNER_TEMP/source-drift.txt"
+          ./tools/resolve-base-digest.sh --check | tee "$RUNNER_TEMP/base-drift.txt"
+
+          {
+            echo "## Upstream drift check"
+            echo
+            echo "### PHP source pins"
+            echo
+            echo '```text'
+            if [ -s "$RUNNER_TEMP/source-drift.txt" ]; then
+              cat "$RUNNER_TEMP/source-drift.txt"
+            else
+              echo "No source pin drift reported."
+            fi
+            echo '```'
+            echo
+            echo "### Base image digests"
+            echo
+            echo '```text'
+            cat "$RUNNER_TEMP/base-drift.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Detect actual drift
+        id: drift
+        run: |
+          set -Eeuo pipefail
+          # --quiet prints source drift as "<series>: DRIFT -- ...". Base drift
+          # is a warning containing "now resolves to"; placeholder and network
+          # warnings deliberately match neither expression.
+          if grep -Eq '^[0-9]+\.[0-9]+: DRIFT -- ' "$RUNNER_TEMP/source-drift.txt" \
+            || grep -Eq '^::warning::[0-9]+\.[0-9]+: .* now resolves to ' "$RUNNER_TEMP/base-drift.txt"; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create or update the drift report Issue
+        if: steps.drift.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TITLE: Upstream pin drift report
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -Eeuo pipefail
+          report="$RUNNER_TEMP/upstream-drift.md"
+          {
+            echo "Upstream moved at the check on $(date -u +'%Y-%m-%d %H:%M:%S UTC')."
+            echo
+            echo "This fixed-title Issue is edited by each run that still finds drift. Evidence: $RUN_URL"
+            echo
+            echo "### PHP source pins"
+            echo
+            echo '```text'
+            if [ -s "$RUNNER_TEMP/source-drift.txt" ]; then
+              cat "$RUNNER_TEMP/source-drift.txt"
+            else
+              echo "No source pin drift reported."
+            fi
+            echo '```'
+            echo
+            echo "### Base image digests"
+            echo
+            echo '```text'
+            cat "$RUNNER_TEMP/base-drift.txt"
+            echo '```'
+            echo
+            echo "Following either change is a reviewed manifest update, not an automatic pin move: diff and review the new source patchset, or rebuild and verify the new base, then record the decision in manifests/SECURITY-REVIEW.md."
+          } > "$report"
+
+          issue_number="$(
+            gh issue list \
+              --state open \
+              --limit 100 \
+              --search "in:title \"$TITLE\"" \
+              --json number,title \
+              --jq '[.[] | select(.title == env.TITLE) | .number] | first // empty'
+          )"
+          if [ -n "$issue_number" ]; then
+            gh issue edit "$issue_number" --body-file "$report"
+            gh issue view "$issue_number" --json url --jq .url
+          else
+            gh issue create --title "$TITLE" --body-file "$report"
+          fi
