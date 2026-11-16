@@ -397,11 +397,11 @@ want 'register cites that version from: published-image'
 want_json '"image_evidence":"published-image"'
 finish
 
-# 15. The real register: 92 rows, every group keyed and cited, no warning of any kind.
+# 15. The real register: 93 rows, every group keyed and cited, no warning of any kind.
 si evidence-real-register 0 "$WORK/bin/registered"
 want 'scan-image: clean'
 want '2 registered'
-want '92 row(s) read from OS-CVE-STATUS.md'
+want '93 row(s) read from OS-CVE-STATUS.md'
 want_not 'cites image evidence'
 want_not 'no image-evidence token'
 want_not 'no token the gate knows'
