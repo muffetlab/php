@@ -189,18 +189,23 @@ pull_token() {
 # one path on the registry this run is already talking to; anything else is
 # ignored rather than followed.
 #
-# Two answers mean "this namespace publishes nothing": HTTP 404 NAME_UNKNOWN on
-# the first page, which is the registry saying it knows no such repository, and
-# HTTP 200 with an empty tags array, which is it saying the repository has no
-# tags. Both leave REPO_UNKNOWN/empty tags for the caller to report, and both are
-# reads that succeeded -- a deleted or freshly created package is the normal
-# state a first release starts from, and the revision rule ("one above the
-# highest -r<N> served, r1 when none is served") answers it directly. Any other
-# code, an unreadable body, or a 404 that does not name NAME_UNKNOWN is a failed
-# read and dies: the difference between "nothing is published" and "I was not
-# told" is the whole rule, so only the exact answer is accepted as the first one.
+# One family of answers means "this namespace publishes nothing", and all of
+# them are reads that succeeded: HTTP 404 NAME_UNKNOWN on the first page, which
+# is the registry saying it knows no such repository, and HTTP 200 whose body
+# carries an empty tag list in one of the shapes registries actually serve --
+# the spec's `{"tags":[]}` and GHCR's `{"tags":null}` for a package nothing has
+# ever been pushed to. All leave REPO_UNKNOWN/empty tags for the caller to
+# report; a deleted or freshly created package is the normal state a first
+# release starts from, and the revision rule ("one above the highest -r<N>
+# served, r1 when none is served") answers it directly. A 200 body that does
+# not carry an explicit tags member of either shape is not a tag list, any
+# other code is not an answer, and a 404 that does not name NAME_UNKNOWN is a
+# failed read -- each dies: the difference between "nothing is published" and
+# "I was not told" is the whole rule, so only the exact answer is accepted as
+# the first one. The die messages quote the body, so the brief is captured
+# before the temp files are removed, not after.
 fetch_tags() { # <token>
-  local tok="$1" path="/v2/${REPO}/tags/list" hdr body link next code first=1
+  local tok="$1" path="/v2/${REPO}/tags/list" hdr body link next code brief first=1
   hdr="$(mktemp)"
   body="$(mktemp)"
   while :; do
@@ -213,6 +218,7 @@ fetch_tags() { # <token>
     case "$code" in
       200) ;;
       404)
+        brief="$(brief_of "$body")"
         if [ "$first" = 1 ] &&
           jq -e -r '.errors[]?.code' "$body" 2>/dev/null | grep -qx NAME_UNKNOWN; then
           REPO_UNKNOWN=1
@@ -220,16 +226,20 @@ fetch_tags() { # <token>
           return 0
         fi
         rm -f "$hdr" "$body"
-        die "the tag list for ${REGISTRY}/${REPO} answered HTTP 404 without naming NAME_UNKNOWN: $(brief_of "$body")" ;;
+        die "the tag list for ${REGISTRY}/${REPO} answered HTTP 404 without naming NAME_UNKNOWN: ${brief}" ;;
       *)
+        brief="$(brief_of "$body")"
         rm -f "$hdr" "$body"
-        die "the tag list for ${REGISTRY}/${REPO} answered HTTP ${code}: $(brief_of "$body")" ;;
+        die "the tag list for ${REGISTRY}/${REPO} answered HTTP ${code}: ${brief}" ;;
     esac
-    jq -e '(.tags | type) == "array"' <"$body" >/dev/null || {
-      rm -f "$hdr" "$body"
-      die "the tag list from ${REGISTRY}/${REPO} did not carry a tags array (HTTP ${code}): $(brief_of "$body")"
-    }
-    jq -r '.tags[]?' <"$body" >>"$TAGS_FILE"
+    if [ -s "$body" ]; then
+      jq -e 'has("tags") and ((.tags | type) == "array" or .tags == null)' <"$body" >/dev/null || {
+        brief="$(brief_of "$body")"
+        rm -f "$hdr" "$body"
+        die "the tag list from ${REGISTRY}/${REPO} answered HTTP ${code} with a body that carries no tags member: ${brief}"
+      }
+      jq -r '.tags[]?' <"$body" >>"$TAGS_FILE"
+    fi
     link="$(tr -d '\r' <"$hdr" |
       awk 'BEGIN{IGNORECASE=1} tolower($1)=="link:"{sub(/^[^:]*:[ \t]*/,""); print; exit}')"
     first=0
